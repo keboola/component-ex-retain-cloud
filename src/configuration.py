@@ -14,8 +14,8 @@ Two models, matching the root/row `configSchema.json` / `configRowSchema.json` s
   be treated as a real problem, not silently ignored.
 
 `fetch_mode` is deliberately NOT a field on either model — V1 only implements `full_fetch` (spec
-§2), and that fact lives as the `FETCH_MODE` constant in `extractor.py`, not as a user-configurable
-or even internally-modeled value here.
+§2), which is why it isn't modeled as a constant or a field anywhere in this component; there is
+nothing to configure or branch on until a second fetch mode exists.
 """
 
 import logging

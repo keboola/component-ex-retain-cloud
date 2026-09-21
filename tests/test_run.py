@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import ijson
 import requests
 from keboola.component.dao import SupportedDataTypes
 from keboola.component.exceptions import UserException
@@ -291,6 +292,30 @@ class TestRunOrchestration(unittest.TestCase):
         client.list_tables.return_value = ["booking"]
         mock_build_schema.return_value = _schema("booking")
         mock_fetch_table.side_effect = requests.exceptions.RetryError("too many 502 retries")
+
+        comp = self._component()
+        with self.assertRaises(UserException):
+            comp.run()
+
+        self.assertFalse((self.data_dir / "out" / "tables" / "booking.csv").exists())
+
+    @mock.patch("component.fetch_table")
+    @mock.patch("component.build_table_schema")
+    @mock.patch("component.RetainCloudClient")
+    def test_malformed_paging_response_raises_user_exception(
+        self, mock_client_cls, mock_build_schema, mock_fetch_table
+    ):
+        # Regression for the just-fixed error-handling gap: a malformed/truncated `paging/paged`
+        # body makes `_iter_envelope` raise `ijson.JSONError`, which is NOT a
+        # `requests.exceptions.RequestException` subclass (its MRO is `JSONError` -> `Exception`)
+        # — before the fix, `run()` only caught `RequestException` here, so this propagated
+        # unhandled to `__main__`'s bare `except Exception` (exit 2, "unexpected internal bug")
+        # instead of the expected `UserException` (exit 1), and must also leave no partial output
+        # behind (same staging rule as the sibling `RetryError` test above).
+        client = mock_client_cls.return_value
+        client.list_tables.return_value = ["booking"]
+        mock_build_schema.return_value = _schema("booking")
+        mock_fetch_table.side_effect = ijson.JSONError("parse error: unexpected end of stream")
 
         comp = self._component()
         with self.assertRaises(UserException):

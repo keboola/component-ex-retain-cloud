@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import ijson
 import requests
 from keboola.component.dao import SupportedDataTypes
 
@@ -202,6 +203,60 @@ class TestFetchTableSingleCall(unittest.TestCase):
         result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
         self.assertEqual(result.row_count, 0)
         self.assertTrue(result.scratch_path.exists())
+
+    def test_malformed_response_raises_ijson_json_error(self):
+        # Confirms the premise `component.py`'s `except ijson.JSONError` clause relies on: a
+        # truncated `paging/paged` body genuinely raises `ijson.JSONError` here (not, say, a plain
+        # `ValueError` or something `requests.exceptions.RequestException` would already catch).
+        client = mock.Mock()
+        resp = mock.Mock(spec=requests.Response)
+        resp.raw = io.BytesIO(b'{"key": "guid", "rowCount": 2, "rowsProcessed": 1, "data": [{"booking_guid": "a"')
+        client.fetch_table_page.return_value = resp
+
+        with self.assertRaises(ijson.JSONError):
+            fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+
+    def test_second_call_still_short_returns_best_effort_without_a_third_call(self):
+        # Spec §6: when the SECOND `paging/paged` call is ALSO short of its own reported
+        # `rowCount` (the table grew faster than the `rowCount + margin` safety margin covered),
+        # `fetch_table` does not issue a third call at all — it logs a warning and returns the
+        # second call's result as best-effort-complete, not a failure. This exact branch
+        # (`result.row_count < row_count_total_2`) previously had zero coverage.
+        first_rows = [
+            {
+                "booking_guid": "a",
+                "booking_hours": 1,
+                "booking_rate": 1.0,
+                "booking_active": True,
+                "booking_createdon": "2026-01-01T00:00:00Z",
+                "booking_notes": "x",
+                "booking_meta": None,
+            }
+        ]
+        second_rows = first_rows + [
+            {
+                "booking_guid": "b",
+                "booking_hours": 2,
+                "booking_rate": 2.0,
+                "booking_active": False,
+                "booking_createdon": "2026-01-02T00:00:00Z",
+                "booking_notes": "y",
+                "booking_meta": None,
+            }
+        ]
+        client = mock.Mock()
+        client.fetch_table_page.side_effect = [
+            _envelope_response(row_count=3, rows=first_rows),  # 1st call: 1 row, short of 3
+            _envelope_response(row_count=5, rows=second_rows),  # 2nd call: 2 rows, STILL short of 5
+        ]
+
+        with self.assertLogs("extractor", level="WARNING") as cm:
+            result = fetch_table(client, "booking", self.schema, page_size=1, scratch_dir=self.scratch_dir)
+
+        self.assertEqual(client.fetch_table_page.call_count, 2)  # no third call issued
+        self.assertTrue(any("still short of its own rowCount" in message for message in cm.output))
+        # Result reflects what the second call actually delivered (2), not its own rowCount claim (5).
+        self.assertEqual(result.row_count, 2)
 
 
 if __name__ == "__main__":

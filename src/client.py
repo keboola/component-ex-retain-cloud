@@ -102,6 +102,7 @@ class RetainCloudClient(HttpClient):
             response.raise_for_status()
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 401:
+                logger.info("Retain Cloud token expired mid-request for %s; re-authenticating and retrying.", path)
                 self.authenticate()
                 response = self.get_raw(path, **kwargs)
                 response.raise_for_status()
@@ -145,6 +146,9 @@ class RetainCloudClient(HttpClient):
             response.raise_for_status()
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 401:
+                logger.info(
+                    "Retain Cloud token expired mid-request for table %r; re-authenticating and retrying.", table
+                )
                 self.authenticate()
                 response = self.post_raw(path, params=params, json={}, stream=True)
                 response.raise_for_status()

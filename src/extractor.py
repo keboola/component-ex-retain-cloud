@@ -5,9 +5,9 @@ a page window. Every response streams into a `/tmp` scratch file — never direc
 `/data/out/tables/` — so a failed second call never leaves a partial/truncated file for Storage to
 upload (see the spec's "Corrected staging rule").
 
-`FETCH_MODE` is the one internal-only constant referenced by this component — spec §2's sanctioned
-Fetch-Mode omission (V1 only ever implements `full_fetch`). It is not a Pydantic field on any model
-(unlike `load_type`, which is a real row-level field — see `configuration.py`).
+V1 only ever implements `full_fetch` (spec §2's sanctioned Fetch-Mode omission) — there is no
+`fetch_mode` field or constant anywhere in this component, unlike `load_type`, which is a real
+row-level field (see `configuration.py`).
 """
 
 import csv
@@ -16,14 +16,15 @@ import logging
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import ijson
 import requests
 from keboola.component.dao import SupportedDataTypes
 
-logger = logging.getLogger(__name__)
+from client import RetainCloudClient
 
-FETCH_MODE = "full_fetch"
+logger = logging.getLogger(__name__)
 
 _DATETIME_TYPE = "DateTime"
 _VERIFY_TYPES = {"Bool", "Int", "Float"}  # verified against real streamed rows before going native
@@ -91,7 +92,7 @@ def build_table_schema(table: str, rich_fields: list[dict]) -> TableSchema_:
 _BOOL_TOKENS = {True, False, "true", "false", "True", "False", "1", "0"}
 
 
-def _coerces(declared_type: str, value) -> bool:
+def _coerces(declared_type: str, value: Any) -> bool:
     if value is None:
         return True
     if declared_type == "Int":
@@ -111,7 +112,7 @@ def _coerces(declared_type: str, value) -> bool:
     return True
 
 
-def _stringify(value) -> str:
+def _stringify(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, (dict, list)):
@@ -192,7 +193,9 @@ def _stream_to_csv(response: requests.Response, schema: TableSchema_, csv_path: 
     )
 
 
-def fetch_table(client, table: str, schema: TableSchema_, page_size: int, scratch_dir: Path) -> FetchResult:
+def fetch_table(
+    client: RetainCloudClient, table: str, schema: TableSchema_, page_size: int, scratch_dir: Path
+) -> FetchResult:
     """Fetch a table to completion into a `/tmp` scratch file (spec §6 algorithm).
 
     Raises `requests.HTTPError` on any HTTP failure and `ijson.JSONError` on a malformed response —

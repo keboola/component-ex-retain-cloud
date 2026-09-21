@@ -14,6 +14,7 @@ from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
 
+import ijson
 import requests
 from keboola.component.base import ComponentBase, sync_action
 from keboola.component.dao import SupportedDataTypes
@@ -224,6 +225,13 @@ class Component(ComponentBase):
             self._process_table(client, cfg)
         except requests.exceptions.RequestException as e:
             raise UserException(self._describe_request_failure(f"Failed to fetch table '{cfg.table}'", e)) from e
+        except ijson.JSONError as e:
+            # `ijson.JSONError` is NOT a `requests.exceptions.RequestException` subclass (it's a
+            # plain `Exception`), so it needs its own clause: a malformed/truncated `paging/paged`
+            # body must still fail this row's job as a `UserException` (exit 1), not fall through
+            # to `__main__`'s bare `except Exception` (exit 2, "unexpected internal bug") — a
+            # malformed response from the source API is a user-visible, not a code, problem.
+            raise UserException(f"Failed to fetch table '{cfg.table}': received a malformed response.") from e
 
     @staticmethod
     def _describe_request_failure(prefix: str, error: requests.exceptions.RequestException) -> str:
@@ -238,6 +246,17 @@ class Component(ComponentBase):
         return f"{prefix}: Retain Cloud API unavailable after retries."
 
     def _build_authenticated_client(self, cfg: RootConfig) -> RetainCloudClient:
+        """Construct and authenticate a fresh client for the calling entrypoint.
+
+        Deliberately NOT hoisted into `__init__` and cached: `test_connection` reports a bad
+        credential as a clean `UserException` result for that one sync action, which requires the
+        construct-then-authenticate call to happen inside the entrypoint that owns it — building
+        (or authenticating) the client any earlier, e.g. in `__init__`, would tie every sync
+        action's failure reporting to whichever entrypoint happened to run first, instead of each
+        one owning its own client and its own outcome. `run()` and `list_tables()` reuse this same
+        helper for consistency, at the cost of one extra client object per invocation — cheap, and
+        correctness here matters more than saving that one allocation.
+        """
         client = RetainCloudClient(
             environment=cfg.environment.value,
             tenant=cfg.tenant,

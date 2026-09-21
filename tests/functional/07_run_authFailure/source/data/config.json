@@ -1,0 +1,12 @@
+{
+  "action": "run",
+  "parameters": {
+    "environment": "us",
+    "tenant": "tenant",
+    "username": "not-a-real-user@example.com",
+    "#password": "definitely-wrong",
+    "table": "billingtype",
+    "load_type": "full_load",
+    "page_size": 50
+  }
+}

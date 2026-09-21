@@ -76,6 +76,13 @@ Run the test suite and perform lint checks using this command:
 docker-compose run --rm test
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+The functional tests replay VCR cassettes committed under `tests/functional/`. Re-recording them
+takes **two** scaffold passes, each with its own secrets file (the second one derived from the
+first by `tests/setup/make_badpassword_secrets.py`) — read
+[`tests/setup/README.md`](tests/setup/README.md) before touching them. The cassettes are public
+and the tenant behind them is a real customer, so the sanitizers in `VCR_SANITIZERS`
+(`src/component.py`) are load-bearing, not cosmetic.
+
 Integration
 ===========
 

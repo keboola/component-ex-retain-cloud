@@ -15,6 +15,11 @@ venv
 
 # vcr datadirtesting
 secrets.json
+# Derived from secrets.json by tests/setup/make_badpassword_secrets.py: real tenant + a
+# deliberately wrong password, used for the bad-credentials recording pass. Carries the real
+# tenant, so it is the same sensitivity class as secrets.json.
+secrets_badpassword.json
+tests/functional/*/source/data/config.secrets.json
 tests/functional/*/source/data/out/
 tests/functional/*/source/data/in/
 

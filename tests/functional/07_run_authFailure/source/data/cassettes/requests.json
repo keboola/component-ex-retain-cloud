@@ -1,0 +1,7 @@
+{
+  "_metadata": {"component_run_duration_seconds": 0.598, "component_run_ended_at": "2026-09-21T13:41:52.070914+00:00", "component_run_started_at": "2026-09-21T13:41:51.472496+00:00", "freeze_time": "2026-09-21T15:41:49", "keboola_vcr_version": "0.7.1", "recorded_at": "2026-09-21T13:41:52.071873+00:00", "recording_duration_seconds": 0.0, "recording_ended_at": "2026-09-21T13:41:52.064973+00:00", "recording_started_at": "2026-09-21T13:41:52.064973+00:00", "request_pairs": 1},
+  "interactions": [
+    {"request": {"body": "{\"useremail\": \"REDACTED\", \"userpassword\": \"REDACTED\", \"environment\": \"us\", \"tenant\": \"REDACTED\"}", "headers": {"Accept": ["*/*"], "Content-Length": ["122"], "Content-Type": ["application/json"]}, "method": "POST", "uri": "https://us.retaincloud.com/IntegrationApi/token"}, "response": {"body": {"string": "{\"error\":\"invalid_request\",\"error_description\":\"Your email or password is invalid.\"}"}, "headers": {"Content-Type": ["application/json; charset=utf-8"], "content-length": ["84"]}, "status": {"code": 400, "message": "Bad Request"}}}
+  ],
+  "version": 1
+}

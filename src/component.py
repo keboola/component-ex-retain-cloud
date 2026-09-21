@@ -5,16 +5,26 @@ straight-line sequence with no per-table loop and no partial-failure bookkeeping
 fails this row's job outright, which the platform already isolates from every other row.
 """
 
+import base64
+import json
 import logging
 import shutil
 import sys
+from collections.abc import MutableMapping
 from pathlib import Path
+from typing import Any
 
 import requests
 from keboola.component.base import ComponentBase, sync_action
 from keboola.component.dao import SupportedDataTypes
 from keboola.component.exceptions import UserException
 from keboola.component.table_schema import FieldSchema, TableSchema
+
+# `keboola.vcr` is a *runtime* dependency here, not a dev-only one: `keboola-component>=1.10.0`
+# (a `[project] dependencies` entry) declares `keboola-vcr` as its own dependency, so it is present
+# in the `--no-dev` production image too. Verified against `uv.lock` (`keboola-component 1.11.0`
+# → `dependencies = [deprecated, keboola-vcr, pygelf]`), not assumed.
+from keboola.vcr import BaseSanitizer, DefaultSanitizer, UrlPatternSanitizer
 
 from client import RetainCloudClient
 from configuration import Configuration, RootConfig
@@ -23,6 +33,174 @@ from extractor import TableSchema_, build_table_schema, fetch_table
 logger = logging.getLogger(__name__)
 
 _SCRATCH_DIR = Path("/tmp/ex-retain-cloud")
+
+# --------------------------------------------------------------------------------------------
+# VCR sanitizers — cassettes for this component are committed to a PUBLIC repo while the tenant
+# behind them is a real customer. The four sanitizers below are what makes leaking the tenant
+# name, the username, or the password structurally impossible rather than a thing to remember —
+# including by arithmetic, which is what entry 4 closes off.
+# The scaffolder and the test runner both pick `VCR_SANITIZERS` up automatically.
+# --------------------------------------------------------------------------------------------
+
+# Far-future `exp` (year 2286) so that `RetainCloudClient._ensure_token()`'s 300s refresh margin
+# never fires mid-replay and demands a token call the cassette does not contain.
+_VCR_SYNTHETIC_TOKEN_EXP = 9999999999
+_VCR_SYNTHETIC_JWT_HEADER = "REDACTEDHEADER"
+_VCR_SYNTHETIC_JWT_SIGNATURE = "REDACTEDSIGNATURE"
+
+
+def _synthetic_bearer_token() -> str:
+    """Build a `Bearer <jwt>` string that is fake but still parseable by `decode_jwt_exp()`."""
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": _VCR_SYNTHETIC_TOKEN_EXP}).encode()).decode().rstrip("=")
+    return f"Bearer {_VCR_SYNTHETIC_JWT_HEADER}.{payload}.{_VCR_SYNTHETIC_JWT_SIGNATURE}"
+
+
+def _sync_content_length(headers: Any, new_length: int) -> None:
+    """Rewrite an already-present `Content-Length` so it matches a body a sanitizer just rewrote.
+
+    Shared by both directions, since both rewrite a body whose declared length survives into the
+    cassette: `DefaultSanitizer`'s header whitelist keeps `content-length`, so a length left at its
+    pre-sanitization value is written out next to a body that no longer has it.
+
+    The two sides hand in different container types, hence the `MutableMapping` check rather than
+    `isinstance(..., dict)`: a recorded response's headers are a plain dict, but a live vcrpy
+    `Request.headers` is a `HeadersDict`, which subclasses `requests`' `CaseInsensitiveDict` and
+    is therefore NOT a `dict` — a `dict` check would silently no-op on every request. Values are
+    plain strings on the request side and lists once serialized into a cassette, so both shapes
+    are handled, and the items are snapshotted before the rewrite rather than mutated mid-iteration.
+
+    The header is only ever UPDATED, never added: a message that never declared a length has
+    nothing that can go stale, and inventing one would change what the cassette claims.
+    """
+    if not isinstance(headers, MutableMapping):
+        return
+    for key, value in list(headers.items()):
+        if key.lower() == "content-length":
+            headers[key] = [str(new_length)] if isinstance(value, list) else str(new_length)
+
+
+def _body_byte_length(body: Any) -> int | None:
+    """Byte length of a request/response body, or None when it cannot be known without cost.
+
+    `None` covers both "no body at all" (every GET here) and a stream/file-like body, which we
+    must not consume just to measure it.
+    """
+    if isinstance(body, str):
+        return len(body.encode("utf-8"))
+    if isinstance(body, bytes | bytearray):
+        return len(body)
+    return None
+
+
+class BearerTokenBodySanitizer(BaseSanitizer):
+    """Replace the `IntegrationApi/token` response body with a *structurally valid* synthetic JWT.
+
+    `POST /IntegrationApi/token` answers with the bare string `Bearer eyJhbGci...` — plain text, no
+    JSON wrapper — and `client.decode_jwt_exp()` base64-decodes its middle segment on EVERY
+    `authenticate()` call, including during cassette replay in CI (the component re-parses whatever
+    body the cassette serves back). A generic `"REDACTED"` here would therefore crash replay inside
+    `json.loads(base64.urlsafe_b64decode(...))`, so the replacement has to keep the three-segment
+    shape and a decodable `exp` claim.
+
+    The check is on the *body*, not the request URL, because `BaseSanitizer.before_record_response`
+    is handed only the response — the originating request is not available here.
+
+    `scrub_before_read` stays at its default `False` (cassette-only): during the live recording run
+    the component must keep using the REAL token to make its subsequent calls. Only the bytes
+    written to the cassette file are synthetic.
+    """
+
+    _PREFIX = "Bearer "
+
+    def before_record_response(self, response: dict) -> dict:
+        body = response.get("body")
+        if not isinstance(body, dict):
+            return response
+
+        raw = body.get("string")
+        if isinstance(raw, bytes):
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return response
+            encode_back = True
+        elif isinstance(raw, str):
+            text = raw
+            encode_back = False
+        else:
+            return response
+
+        # `client.authenticate()` does `response.text.strip()`, so tolerate surrounding whitespace.
+        if not text.lstrip().startswith(self._PREFIX):
+            return response
+
+        replacement = _synthetic_bearer_token()
+        body["string"] = replacement.encode("utf-8") if encode_back else replacement
+        # The synthetic token is a different length from the real one. vcrpy's replay stub reads
+        # the body from a buffer rather than honouring this header, so a stale value is most
+        # likely harmless — but a cassette whose declared length contradicts its body is a trap
+        # for any future reader or tool, so fix it.
+        _sync_content_length(response.get("headers"), len(replacement.encode("utf-8")))
+        return response
+
+
+class RequestContentLengthSanitizer(BaseSanitizer):
+    """Resync a recorded REQUEST's `Content-Length` with the body the sanitizers ahead of it left.
+
+    The response side of this problem is handled inside `BearerTokenBodySanitizer`; this is the
+    request side, and here a stale length is not merely untidy. `DefaultSanitizer` rewrites the
+    token POST body to `{"useremail": "REDACTED", "userpassword": "REDACTED", "environment": "us",
+    "tenant": "REDACTED"}` but keeps `content-length` (it is on its safe-header whitelist) at the
+    PRE-redaction value, so the difference between the declared length and the redacted body's
+    real length is exactly the combined length of the three original values. The
+    deliberately-wrong-credential recordings (`02`/`04`/`07`) pin the username and password to
+    publicly-known dummies, which makes the real tenant's character count recoverable by
+    subtraction against the success recordings. A character count is not identifying by itself,
+    but "leaking the tenant name is structurally impossible" is the guarantee the block above
+    exists to make, and an arithmetic side channel is not that.
+
+    Ordered LAST in `VCR_SANITIZERS`: `CompositeSanitizer` applies sanitizers in list order, so
+    running last is what guarantees this one measures the FINAL body rather than an intermediate
+    one — true for today's chain and for any body rewrite added to it later.
+
+    `scrub_before_read` stays at its default `False`: this only ever touches cassette bytes, and
+    the live request the component actually sends is never reshaped by it.
+    """
+
+    def before_record_request(self, request: Any) -> Any:
+        length = _body_byte_length(getattr(request, "body", None))
+        if length is not None:
+            _sync_content_length(getattr(request, "headers", None), length)
+        return request
+
+
+VCR_SANITIZERS = [
+    # 1. Field-name redaction for the token REQUEST body, which `client.authenticate()` posts as
+    #    `{"useremail", "userpassword", "environment", "tenant"}`. `DefaultSanitizer` matches keys
+    #    EXACTLY and its built-in defaults cover `password`/`token` but NOT `userpassword` /
+    #    `useremail` — this API's actual field names. The password would usually also be caught by
+    #    the recorder's automatic exact-value pass over `#`-prefixed secrets, but `username` and
+    #    `tenant` are not `#`-prefixed in `secrets.json`, so without these entries they would get
+    #    no protection at all. Redacting by NAME also means it still works for the deliberately
+    #    -wrong-credentials recordings, where the values are not the real ones.
+    #
+    #    Note the header whitelist is deliberately left at its default (`content-type`,
+    #    `content-length`, `accept`): that is what strips the `Authorization: Bearer <jwt>` request
+    #    header from every non-token call. Do not add it to `additional_safe_headers`.
+    DefaultSanitizer(additional_sensitive_fields=["userpassword", "useremail", "tenant"]),
+    # 2. The tenant is a real customer identifier and it sits in the URL PATH of every
+    #    DataAccessAPI call (`client.py`: `https://{host}/DataAccessAPI/{tenant}/api/`), not just in
+    #    the token body. The default `match_on` includes `path`, so the rewrite has to be identical
+    #    on the recorded and the replayed side — hence a GENERIC pattern with a fixed replacement
+    #    (hardcoding the real tenant here would itself leak it into this public repo) plus a
+    #    `"tenant"` placeholder in every test config so replay produces the same path.
+    UrlPatternSanitizer(patterns=[(r"/DataAccessAPI/[^/]+/", "/DataAccessAPI/tenant/")]),
+    # 3. Structurally valid synthetic JWT for the plain-text token response — see the class docstring.
+    BearerTokenBodySanitizer(),
+    # 4. Content-Length fix-up for the request bodies entry 1 shortened. MUST STAY LAST — see the
+    #    class docstring; it measures whatever body the preceding sanitizers ended up with.
+    RequestContentLengthSanitizer(),
+]
 
 
 class Component(ComponentBase):

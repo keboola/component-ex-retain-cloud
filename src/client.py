@@ -127,17 +127,26 @@ class RetainCloudClient(HttpClient):
         The caller (`extractor.py`) is responsible for consuming `response.raw` with `ijson` — this
         method never reads the body itself, so the "one/two calls per table" contract (spec §6)
         stays entirely in the caller's hands.
+
+        `json={}` is REQUIRED, not cosmetic: a bodyless POST to this endpoint returns a generic
+        `400 {"status":"error","message":"invalid request"}` before the endpoint ever looks at
+        `pageSize`/`sequential` — confirmed live against the real API (Phase 5 VCR recording hit
+        this exact 400; a follow-up probe isolated it to the missing body/`Content-Type`, since an
+        empty JSON object made the identical call return 200). `pageSize`/`sequential` still belong
+        in the query string per the resolved paging contract (research §3: the endpoint has no
+        body-driven DTO for them at all — an empty body's presence is what satisfies the framework's
+        request-model binding, its *content* is irrelevant and any extra keys are silently ignored).
         """
         self._ensure_token()
         params = {"pageSize": page_size, "sequential": "true"}
         path = f"tableaccess/{table}/paging/paged"
-        response = self.post_raw(path, params=params, stream=True)
+        response = self.post_raw(path, params=params, json={}, stream=True)
         try:
             response.raise_for_status()
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 401:
                 self.authenticate()
-                response = self.post_raw(path, params=params, stream=True)
+                response = self.post_raw(path, params=params, json={}, stream=True)
                 response.raise_for_status()
             else:
                 raise

@@ -733,14 +733,36 @@ class TestFetchTableSingleCall(unittest.TestCase):
         self.assertNotIn("booking_guid", content)  # headerless — no header row
 
     def test_second_call_issued_when_first_call_is_short(self):
-        first_rows = [{"booking_guid": "a", "booking_hours": 1, "booking_rate": 1.0,
-                        "booking_active": True, "booking_createdon": "2026-01-01T00:00:00Z",
-                        "booking_notes": "x", "booking_meta": None}]
+        first_rows = [
+            {
+                "booking_guid": "a",
+                "booking_hours": 1,
+                "booking_rate": 1.0,
+                "booking_active": True,
+                "booking_createdon": "2026-01-01T00:00:00Z",
+                "booking_notes": "x",
+                "booking_meta": None,
+            }
+        ]
         second_rows = first_rows + [
-            {"booking_guid": "b", "booking_hours": 2, "booking_rate": 2.0, "booking_active": False,
-             "booking_createdon": "2026-01-02T00:00:00Z", "booking_notes": "y", "booking_meta": None},
-            {"booking_guid": "c", "booking_hours": 3, "booking_rate": 3.0, "booking_active": True,
-             "booking_createdon": "2026-01-03T00:00:00Z", "booking_notes": "z", "booking_meta": None},
+            {
+                "booking_guid": "b",
+                "booking_hours": 2,
+                "booking_rate": 2.0,
+                "booking_active": False,
+                "booking_createdon": "2026-01-02T00:00:00Z",
+                "booking_notes": "y",
+                "booking_meta": None,
+            },
+            {
+                "booking_guid": "c",
+                "booking_hours": 3,
+                "booking_rate": 3.0,
+                "booking_active": True,
+                "booking_createdon": "2026-01-03T00:00:00Z",
+                "booking_notes": "z",
+                "booking_meta": None,
+            },
         ]
         client = mock.Mock()
         client.fetch_table_page.side_effect = [
@@ -760,10 +782,24 @@ class TestFetchTableSingleCall(unittest.TestCase):
 
     def test_pk_not_unique_falls_back_to_no_pk(self):
         rows = [
-            {"booking_guid": "dup", "booking_hours": 1, "booking_rate": 1.0, "booking_active": True,
-             "booking_createdon": "2026-01-01T00:00:00Z", "booking_notes": "x", "booking_meta": None},
-            {"booking_guid": "dup", "booking_hours": 2, "booking_rate": 2.0, "booking_active": False,
-             "booking_createdon": "2026-01-02T00:00:00Z", "booking_notes": "y", "booking_meta": None},
+            {
+                "booking_guid": "dup",
+                "booking_hours": 1,
+                "booking_rate": 1.0,
+                "booking_active": True,
+                "booking_createdon": "2026-01-01T00:00:00Z",
+                "booking_notes": "x",
+                "booking_meta": None,
+            },
+            {
+                "booking_guid": "dup",
+                "booking_hours": 2,
+                "booking_rate": 2.0,
+                "booking_active": False,
+                "booking_createdon": "2026-01-02T00:00:00Z",
+                "booking_notes": "y",
+                "booking_meta": None,
+            },
         ]
         client = mock.Mock()
         client.fetch_table_page.return_value = _envelope_response(row_count=2, rows=rows)
@@ -773,8 +809,15 @@ class TestFetchTableSingleCall(unittest.TestCase):
 
     def test_int_column_downgraded_to_string_on_non_numeric_value(self):
         rows = [
-            {"booking_guid": "a", "booking_hours": "DELIVERED", "booking_rate": 1.0, "booking_active": True,
-             "booking_createdon": "2026-01-01T00:00:00Z", "booking_notes": "x", "booking_meta": None},
+            {
+                "booking_guid": "a",
+                "booking_hours": "DELIVERED",
+                "booking_rate": 1.0,
+                "booking_active": True,
+                "booking_createdon": "2026-01-01T00:00:00Z",
+                "booking_notes": "x",
+                "booking_meta": None,
+            },
         ]
         client = mock.Mock()
         client.fetch_table_page.return_value = _envelope_response(row_count=1, rows=rows)
@@ -903,13 +946,13 @@ def _coerces(declared_type: str, value) -> bool:
         try:
             int(value)
             return True
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return False
     if declared_type == "Float":
         try:
             float(value)
             return True
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return False
     if declared_type == "Bool":
         return value in _BOOL_TOKENS
@@ -971,18 +1014,27 @@ def _stream_to_csv(response: requests.Response, schema: TableSchema_, csv_path: 
             row_count += 1
             extra_keys = set(row) - set(fieldnames)
             if extra_keys and not schema_drift_logged:
-                logger.warning("Table %s: row carries fields outside the discovered schema: %s", schema.table, sorted(extra_keys))
+                logger.warning(
+                    "Table %s: row carries fields outside the discovered schema: %s", schema.table, sorted(extra_keys)
+                )
                 schema_drift_logged = True
             for name in verified:
                 if verified[name] and not _coerces(declared_by_name[name], row.get(name)):
                     verified[name] = False
-                    logger.warning("Table %s column %s: value did not match declared type %s, downgrading to STRING", schema.table, name, declared_by_name[name])
+                    logger.warning(
+                        "Table %s column %s: value did not match declared type %s, downgrading to STRING",
+                        schema.table,
+                        name,
+                        declared_by_name[name],
+                    )
             writer.writerow([_stringify(row.get(name)) for name in fieldnames])
             if schema.pk_column:
                 pk_values.add(row.get(schema.pk_column))
 
     pk_unique = schema.pk_column is not None and len(pk_values) == row_count
-    return FetchResult(scratch_path=csv_path, row_count=row_count, pk_unique=pk_unique, verified_columns=verified), row_count_total
+    return FetchResult(
+        scratch_path=csv_path, row_count=row_count, pk_unique=pk_unique, verified_columns=verified
+    ), row_count_total
 
 
 def fetch_table(client, table: str, schema: TableSchema_, page_size: int, scratch_dir: Path) -> FetchResult:
@@ -1010,7 +1062,9 @@ def fetch_table(client, table: str, schema: TableSchema_, page_size: int, scratc
         logger.warning(
             "Table %s: second paging/paged call still short of its own rowCount (%s < %s) — "
             "treating this run as best-effort complete; the next run will pick up any tail rows.",
-            table, result.row_count, row_count_total_2,
+            table,
+            result.row_count,
+            row_count_total_2,
         )
     return result
 ```
@@ -1292,10 +1346,14 @@ class TestRunOrchestration(unittest.TestCase):
         client = mock_client_cls.return_value
         client.list_tables.return_value = ["booking", "resource"]
         mock_build_schema.return_value = _schema("booking")
-        mock_fetch_table.side_effect = lambda _client, table, _schema, _page_size, scratch_dir: _fetch_result(scratch_dir, table)
+        mock_fetch_table.side_effect = lambda _client, table, _schema, _page_size, scratch_dir: _fetch_result(
+            scratch_dir, table
+        )
 
         comp = self._component()
-        with mock.patch.object(type(comp), "_data_dir", new_callable=mock.PropertyMock, return_value=str(self.data_dir)):
+        with mock.patch.object(
+            type(comp), "_data_dir", new_callable=mock.PropertyMock, return_value=str(self.data_dir)
+        ):
             comp.run()  # must not raise
 
         self.assertTrue((self.data_dir / "out" / "tables" / "booking.csv").exists())
@@ -1310,7 +1368,9 @@ class TestRunOrchestration(unittest.TestCase):
         mock_fetch_table.side_effect = requests.HTTPError(response=mock.Mock(status_code=403))
 
         comp = self._component()
-        with mock.patch.object(type(comp), "_data_dir", new_callable=mock.PropertyMock, return_value=str(self.data_dir)):
+        with mock.patch.object(
+            type(comp), "_data_dir", new_callable=mock.PropertyMock, return_value=str(self.data_dir)
+        ):
             with self.assertRaises(UserException):
                 comp.run()
 
@@ -1319,12 +1379,16 @@ class TestRunOrchestration(unittest.TestCase):
     @mock.patch("component.fetch_table")
     @mock.patch("component.build_table_schema")
     @mock.patch("component.RetainCloudClient")
-    def test_table_missing_from_structure_raises_user_exception(self, mock_client_cls, mock_build_schema, mock_fetch_table):
+    def test_table_missing_from_structure_raises_user_exception(
+        self, mock_client_cls, mock_build_schema, mock_fetch_table
+    ):
         client = mock_client_cls.return_value
         client.list_tables.return_value = ["resource"]  # "booking" was selected but no longer exists
 
         comp = self._component()
-        with mock.patch.object(type(comp), "_data_dir", new_callable=mock.PropertyMock, return_value=str(self.data_dir)):
+        with mock.patch.object(
+            type(comp), "_data_dir", new_callable=mock.PropertyMock, return_value=str(self.data_dir)
+        ):
             with self.assertRaises(UserException):
                 comp.run()
 
@@ -1354,7 +1418,9 @@ class TestRunOrchestration(unittest.TestCase):
     @mock.patch("component.fetch_table")
     @mock.patch("component.build_table_schema")
     @mock.patch("component.RetainCloudClient")
-    def test_full_load_with_nonunique_pk_declares_no_primary_key(self, mock_client_cls, mock_build_schema, mock_fetch_table):
+    def test_full_load_with_nonunique_pk_declares_no_primary_key(
+        self, mock_client_cls, mock_build_schema, mock_fetch_table
+    ):
         # This is the direct regression test for spec §7 case 13 / the gate-fix data-loss bug: a
         # DEFAULT full_load row (load_type not set at all) whose <table>_guid has a duplicate value
         # this run must NOT declare a primary key — declaring one would make Storage deduplicate on
@@ -1375,7 +1441,9 @@ class TestRunOrchestration(unittest.TestCase):
     @mock.patch("component.fetch_table")
     @mock.patch("component.build_table_schema")
     @mock.patch("component.RetainCloudClient")
-    def test_full_load_with_unique_pk_still_declares_primary_key(self, mock_client_cls, mock_build_schema, mock_fetch_table):
+    def test_full_load_with_unique_pk_still_declares_primary_key(
+        self, mock_client_cls, mock_build_schema, mock_fetch_table
+    ):
         # Symmetric case: a unique PK is declared even on full_load (Storage can still dedupe
         # within a single load), confirming the fix doesn't over-correct into never declaring a PK.
         client = mock_client_cls.return_value
@@ -1394,7 +1462,9 @@ class TestRunOrchestration(unittest.TestCase):
     @mock.patch("component.fetch_table")
     @mock.patch("component.build_table_schema")
     @mock.patch("component.RetainCloudClient")
-    def test_incremental_load_falls_back_when_pk_not_verified(self, mock_client_cls, mock_build_schema, mock_fetch_table):
+    def test_incremental_load_falls_back_when_pk_not_verified(
+        self, mock_client_cls, mock_build_schema, mock_fetch_table
+    ):
         client = mock_client_cls.return_value
         client.list_tables.return_value = ["booking"]
         mock_build_schema.return_value = _schema("booking")
@@ -1500,7 +1570,8 @@ class Component(ComponentBase):
         if cfg.incremental and not result.pk_unique:
             logger.warning(
                 "Table %s: Incremental Load was requested but the primary key did not verify "
-                "unique this run — falling back to full load for this run.", cfg.table,
+                "unique this run — falling back to full load for this run.",
+                cfg.table,
             )
 
         # `create_out_table_definition_from_schema`'s `incremental` kwarg is VERIFIED (not
@@ -1660,8 +1731,11 @@ class TestNoSecretLeakage(unittest.TestCase):
 
     def test_config_str_and_repr_never_contain_password(self):
         cfg = Configuration(
-            environment="us", tenant="acme", username="user@example.com",
-            **{"#password": SECRET_PASSWORD}, table="booking",
+            environment="us",
+            tenant="acme",
+            username="user@example.com",
+            **{"#password": SECRET_PASSWORD},
+            table="booking",
         )
         self.assertNotIn(SECRET_PASSWORD, str(cfg))
         self.assertNotIn(SECRET_PASSWORD, repr(cfg))

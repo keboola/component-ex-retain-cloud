@@ -40,6 +40,24 @@ def _fetch_result(scratch_dir: Path, table: str, row_count=1, pk_unique=True) ->
     return FetchResult(scratch_path=path, row_count=row_count, pk_unique=pk_unique, verified_columns={})
 
 
+def _schema_with_int_column(table: str) -> TableSchema_:
+    return TableSchema_(
+        table=table,
+        columns=[
+            ColumnSchema(name=f"{table}_guid", declared_type="ID", base_type=SupportedDataTypes.STRING),
+            ColumnSchema(name=f"{table}_hours", declared_type="Int", base_type=SupportedDataTypes.INTEGER),
+        ],
+        pk_column=f"{table}_guid",
+    )
+
+
+def _fetch_result_with_verification(scratch_dir: Path, table: str, verified_columns: dict[str, bool]) -> FetchResult:
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    path = scratch_dir / f"{table}.csv"
+    path.write_text(f"{table}-row-1\n")
+    return FetchResult(scratch_path=path, row_count=1, pk_unique=True, verified_columns=verified_columns)
+
+
 class TestRunOrchestration(unittest.TestCase):
     def setUp(self):
         self.data_dir = Path(tempfile.mkdtemp())
@@ -127,6 +145,7 @@ class TestRunOrchestration(unittest.TestCase):
         def capture(table_schema, **kwargs):
             captured["incremental"] = kwargs.get("incremental")
             captured["primary_keys"] = table_schema.primary_keys
+            captured["fields_by_name"] = {f.name: f.base_type for f in table_schema.fields}
             return original(table_schema, **kwargs)
 
         with mock.patch.object(comp, "create_out_table_definition_from_schema", side_effect=capture):
@@ -212,6 +231,72 @@ class TestRunOrchestration(unittest.TestCase):
 
         self.assertTrue(captured["incremental"])
         self.assertEqual(captured["primary_keys"], ["booking_guid"])
+
+    @mock.patch("component.fetch_table")
+    @mock.patch("component.build_table_schema")
+    @mock.patch("component.RetainCloudClient")
+    def test_failed_column_verification_downgrades_manifest_type_to_string(
+        self, mock_client_cls, mock_build_schema, mock_fetch_table
+    ):
+        # Regression for the output-state gate finding: extractor.py computes `verified_columns`
+        # (which Bool/Int/Float native-type candidates failed this run's per-row coercion check,
+        # logged as "downgrading to STRING") but `_to_output_schema` used to build the manifest
+        # straight from the PRE-verification `schema.columns[].base_type`, silently discarding that
+        # signal — a column extractor.py explicitly flagged as failed still shipped as its declared
+        # native type. Asserts the emitted `FieldSchema.base_type` is STRING for that column only.
+        client = mock_client_cls.return_value
+        client.list_tables.return_value = ["booking"]
+        mock_build_schema.return_value = _schema_with_int_column("booking")
+        mock_fetch_table.side_effect = lambda _client, table, _schema, _page_size, scratch_dir: (
+            _fetch_result_with_verification(scratch_dir, table, verified_columns={f"{table}_hours": False})
+        )
+
+        comp = self._component(ROW_PARAMS)
+        captured = self._run_and_capture(comp)
+
+        self.assertEqual(captured["fields_by_name"]["booking_hours"], SupportedDataTypes.STRING)
+        self.assertEqual(captured["fields_by_name"]["booking_guid"], SupportedDataTypes.STRING)  # unaffected
+
+    @mock.patch("component.fetch_table")
+    @mock.patch("component.build_table_schema")
+    @mock.patch("component.RetainCloudClient")
+    def test_retries_exhausted_verifying_table_exists_raises_user_exception(
+        self, mock_client_cls, mock_build_schema, mock_fetch_table
+    ):
+        # Regression for the error-handling gate finding: `HttpClient`'s retry adapter uses
+        # `raise_on_status=True`, so a sustained 502/503 exhausting retries raises
+        # `requests.exceptions.RetryError`, which is NOT a `requests.HTTPError` — before the fix,
+        # `run()` only caught `HTTPError` here, so this propagated unhandled to the generic
+        # exit-2 path instead of the expected `UserException` (exit 1).
+        client = mock_client_cls.return_value
+        client.list_tables.side_effect = requests.exceptions.RetryError("too many 503 retries")
+
+        comp = self._component()
+        with self.assertRaises(UserException):
+            comp.run()
+
+        mock_build_schema.assert_not_called()
+        mock_fetch_table.assert_not_called()
+
+    @mock.patch("component.fetch_table")
+    @mock.patch("component.build_table_schema")
+    @mock.patch("component.RetainCloudClient")
+    def test_retries_exhausted_fetching_table_raises_user_exception(
+        self, mock_client_cls, mock_build_schema, mock_fetch_table
+    ):
+        # Same fix, data-fetch path: a `RetryError` from the paging/schema fetch (via
+        # `_process_table`) must also become a `UserException`, not exit 2, and must leave no
+        # partial output behind (the staging rule already covers this — no file is ever moved).
+        client = mock_client_cls.return_value
+        client.list_tables.return_value = ["booking"]
+        mock_build_schema.return_value = _schema("booking")
+        mock_fetch_table.side_effect = requests.exceptions.RetryError("too many 502 retries")
+
+        comp = self._component()
+        with self.assertRaises(UserException):
+            comp.run()
+
+        self.assertFalse((self.data_dir / "out" / "tables" / "booking.csv").exists())
 
 
 if __name__ == "__main__":

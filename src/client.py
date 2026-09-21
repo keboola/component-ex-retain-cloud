@@ -57,22 +57,31 @@ class RetainCloudClient(HttpClient):
         Never logs `self._password` or the response body — only the HTTP status on failure.
         """
         token_url = f"https://{self._host}/IntegrationApi/token"
-        response = self.post_raw(
-            token_url,
-            is_absolute_path=True,
-            ignore_auth=True,
-            json={
-                "useremail": self._username,
-                "userpassword": self._password,
-                "environment": self._environment,
-                "tenant": self._tenant,
-            },
-        )
         try:
+            response = self.post_raw(
+                token_url,
+                is_absolute_path=True,
+                ignore_auth=True,
+                json={
+                    "useremail": self._username,
+                    "userpassword": self._password,
+                    "environment": self._environment,
+                    "tenant": self._tenant,
+                },
+            )
             response.raise_for_status()
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else "unknown"
             raise UserException(f"Retain Cloud authentication failed (HTTP {status}).") from e
+        except requests.exceptions.RequestException as e:
+            # `HttpClient`'s retry adapter uses `raise_on_status=True`, so an exhausted 429/5xx (or
+            # a connection failure/timeout) surfaces as `RetryError`/`ConnectionError`/`Timeout` —
+            # none of which are `HTTPError` subclasses, so none would be caught above — rather than
+            # a response we could call `raise_for_status()` on. `post_raw` itself is what raises
+            # these (before a response even exists), which is why it's inside this same `try`.
+            # Without this clause it would propagate past this method as an "unexpected" failure
+            # (exit 2) instead of the retryable, user-visible outage it actually is (spec §3).
+            raise UserException("Retain Cloud authentication failed: API unavailable after retries.") from e
 
         token_body = response.text.strip()
         self._token_exp = decode_jwt_exp(token_body)
@@ -83,13 +92,22 @@ class RetainCloudClient(HttpClient):
             self.authenticate()
 
     def _get_with_reauth(self, path: str, **kwargs):
+        # Deliberately `get_raw` (undecorated), not `get` — `HttpClient.get`'s
+        # `response_error_handling` decorator unconditionally logs a WARNING with a full traceback
+        # for *any* `HTTPError`, including the 401 this method expects and handles gracefully via
+        # reauth-and-retry below. `get_raw` does no such logging, matching the manual
+        # `raise_for_status()` pattern `fetch_table_page` already uses with `post_raw`.
+        response = self.get_raw(path, **kwargs)
         try:
-            return self.get(path, **kwargs)
+            response.raise_for_status()
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 401:
                 self.authenticate()
-                return self.get(path, **kwargs)
-            raise
+                response = self.get_raw(path, **kwargs)
+                response.raise_for_status()
+            else:
+                raise
+        return response.json()
 
     def list_tables(self) -> list[str]:
         self._ensure_token()

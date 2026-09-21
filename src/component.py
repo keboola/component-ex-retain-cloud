@@ -12,6 +12,7 @@ from pathlib import Path
 
 import requests
 from keboola.component.base import ComponentBase, sync_action
+from keboola.component.dao import SupportedDataTypes
 from keboola.component.exceptions import UserException
 from keboola.component.table_schema import FieldSchema, TableSchema
 
@@ -32,14 +33,31 @@ class Component(ComponentBase):
         cfg = Configuration(**self.configuration.parameters)
         client = self._build_authenticated_client(cfg)
 
-        if cfg.table not in set(client.list_tables()):
+        try:
+            table_exists = cfg.table in set(client.list_tables())
+        except requests.exceptions.RequestException as e:
+            raise UserException(
+                self._describe_request_failure(f"Failed to verify table '{cfg.table}' exists", e)
+            ) from e
+        if not table_exists:
             raise UserException(f"Table '{cfg.table}' is no longer present in this tenant's structure.")
 
         try:
             self._process_table(client, cfg)
-        except requests.HTTPError as e:
-            status = e.response.status_code if e.response is not None else "unknown"
-            raise UserException(f"Failed to fetch table '{cfg.table}' (HTTP {status}).") from e
+        except requests.exceptions.RequestException as e:
+            raise UserException(self._describe_request_failure(f"Failed to fetch table '{cfg.table}'", e)) from e
+
+    @staticmethod
+    def _describe_request_failure(prefix: str, error: requests.exceptions.RequestException) -> str:
+        """Build a `UserException` message covering both an HTTP-status failure (`HTTPError`,
+        whose `.response.status_code` is reported) and a retries-exhausted/connection failure
+        (`RetryError`/`ConnectionError`/`Timeout` — none of which carry a usable `.response`, since
+        `HttpClient`'s retry adapter raises them from within the request call itself, before any
+        response exists)."""
+        status = getattr(getattr(error, "response", None), "status_code", None)
+        if status is not None:
+            return f"{prefix} (HTTP {status})."
+        return f"{prefix}: Retain Cloud API unavailable after retries."
 
     def _build_authenticated_client(self, cfg: RootConfig) -> RetainCloudClient:
         client = RetainCloudClient(
@@ -71,7 +89,7 @@ class Component(ComponentBase):
         # `(self, table_schema, is_sliced=False, destination='', incremental: bool = None,
         # enclosure='"', delimiter=',', delete_where=None)` — `incremental` is real.
         table_def = self.create_out_table_definition_from_schema(
-            self._to_output_schema(schema, result.pk_unique),
+            self._to_output_schema(schema, result.pk_unique, result.verified_columns),
             incremental=incremental_for_table,
         )
         Path(table_def.full_path).parent.mkdir(parents=True, exist_ok=True)
@@ -79,7 +97,7 @@ class Component(ComponentBase):
         self.write_manifest(table_def)
 
     @staticmethod
-    def _to_output_schema(schema: TableSchema_, pk_unique: bool) -> TableSchema:
+    def _to_output_schema(schema: TableSchema_, pk_unique: bool, verified_columns: dict[str, bool]) -> TableSchema:
         # The PK is declared ONLY when this run's uniqueness check passed (spec §6/§7 case 13) —
         # for BOTH full and incremental load. Declaring a non-unique PK would make Storage
         # deduplicate on the declared key at import time, silently dropping a row every run, on
@@ -89,7 +107,18 @@ class Component(ComponentBase):
         # the explicit `schema.pk_column` check below is redundant at runtime — it's here purely to
         # narrow `str | None` to `str` for the type checker.
         primary_keys = [schema.pk_column] if pk_unique and schema.pk_column else None
-        fields = [FieldSchema(name=c.name, base_type=c.base_type, nullable=True) for c in schema.columns]
+        fields = []
+        for c in schema.columns:
+            # `verified_columns` only has entries for Bool/Int/Float-declared columns (extractor.py's
+            # `_stream_to_csv` seeds it from `_VERIFY_TYPES`); a column absent from it (DateTime/ID/
+            # String/Unknown) was never a native-type candidate, so it keeps its already-STRING or
+            # trusted-DateTime `base_type` unconditionally (`.get(c.name, True)` below). A column
+            # PRESENT but False failed this run's per-row coercion check and must ship as STRING —
+            # forwarding the pre-verification `base_type` here would silently re-introduce the
+            # exact "declared numeric but really not" failure mode the streaming verification pass
+            # exists to catch (spec §6).
+            base_type = c.base_type if verified_columns.get(c.name, True) else SupportedDataTypes.STRING
+            fields.append(FieldSchema(name=c.name, base_type=base_type, nullable=True))
         return TableSchema(name=schema.table, fields=fields, primary_keys=primary_keys)
 
     @sync_action("testConnection")

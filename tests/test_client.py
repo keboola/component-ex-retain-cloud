@@ -77,6 +77,19 @@ class TestRetainCloudClientAuth(unittest.TestCase):
         with self.assertRaises(UserException):
             self.client.authenticate()
 
+    @mock.patch.object(RetainCloudClient, "post_raw")
+    def test_authenticate_raises_user_exception_on_retries_exhausted(self, mock_post_raw):
+        # `HttpClient`'s retry adapter uses `raise_on_status=True`, so a sustained 502/503 that
+        # exhausts retries raises `requests.exceptions.RetryError` from *within* `post_raw` itself
+        # (before any response exists to call `raise_for_status()` on) — not a `requests.HTTPError`.
+        # Without the dedicated `RequestException` handling this must surface as `UserException`
+        # (exit 1), not propagate unhandled to the generic exit-2 path.
+        from keboola.component.exceptions import UserException
+
+        mock_post_raw.side_effect = requests.exceptions.RetryError("too many 502 retries")
+        with self.assertRaises(UserException):
+            self.client.authenticate()
+
     @mock.patch.object(RetainCloudClient, "authenticate")
     def test_ensure_token_reauthenticates_when_near_expiry(self, mock_authenticate):
         self.client._token_exp = int(time.time()) + 60  # under the 5-minute margin
@@ -95,28 +108,58 @@ class TestRetainCloudClientDiscovery(unittest.TestCase):
         self.client = RetainCloudClient("us", "acme", "user@example.com", "pw")
         self.client._token_exp = int(time.time()) + 3600  # skip auth in these tests
 
-    @mock.patch.object(RetainCloudClient, "get")
-    def test_list_tables(self, mock_get):
-        mock_get.return_value = ["booking", "resource"]
+    @mock.patch.object(RetainCloudClient, "get_raw")
+    def test_list_tables(self, mock_get_raw):
+        # `_get_with_reauth` deliberately calls `get_raw` (undecorated), not `get` — see the
+        # comment on `_get_with_reauth` for why (avoids a noisy library WARNING+traceback log on a
+        # 401 this method already handles gracefully).
+        mock_get_raw.return_value = _response(status_code=200, json_body=["booking", "resource"])
         self.assertEqual(self.client.list_tables(), ["booking", "resource"])
-        mock_get.assert_called_once_with("structure")
+        mock_get_raw.assert_called_once_with("structure")
 
-    @mock.patch.object(RetainCloudClient, "get")
-    def test_get_table_schema(self, mock_get):
-        mock_get.return_value = [{"name": "booking_guid", "dataType": "ID"}]
+    @mock.patch.object(RetainCloudClient, "get_raw")
+    def test_get_table_schema(self, mock_get_raw):
+        mock_get_raw.return_value = _response(status_code=200, json_body=[{"name": "booking_guid", "dataType": "ID"}])
         result = self.client.get_table_schema("booking")
         self.assertEqual(result, [{"name": "booking_guid", "dataType": "ID"}])
-        mock_get.assert_called_once_with("structure/richfieldstructure", params={"table": "booking"})
+        mock_get_raw.assert_called_once_with("structure/richfieldstructure", params={"table": "booking"})
 
     @mock.patch.object(RetainCloudClient, "authenticate")
-    @mock.patch.object(RetainCloudClient, "get")
-    def test_discovery_reauthenticates_once_on_401_then_retries(self, mock_get, mock_authenticate):
-        unauthorized = requests.HTTPError(response=_response(status_code=401))
-        mock_get.side_effect = [unauthorized, ["booking"]]
+    @mock.patch.object(RetainCloudClient, "get_raw")
+    def test_discovery_reauthenticates_once_on_401_then_retries(self, mock_get_raw, mock_authenticate):
+        mock_get_raw.side_effect = [
+            _response(status_code=401),
+            _response(status_code=200, json_body=["booking"]),
+        ]
         result = self.client.list_tables()
         self.assertEqual(result, ["booking"])
         mock_authenticate.assert_called_once()
-        self.assertEqual(mock_get.call_count, 2)
+        self.assertEqual(mock_get_raw.call_count, 2)
+
+    @mock.patch.object(RetainCloudClient, "authenticate")
+    @mock.patch.object(RetainCloudClient, "get_raw")
+    def test_handled_401_does_not_log_a_warning(self, mock_get_raw, mock_authenticate):
+        # Regression for the cosmetic-noise finding: `HttpClient.get`'s decorator logs a WARNING
+        # with a full traceback for *any* `HTTPError`, including a 401 this method handles
+        # gracefully via reauth-and-retry — `_get_with_reauth` avoids that entirely by calling
+        # `get_raw` instead (see its docstring comment). `assertNoLogs` fails loudly if any logger
+        # emits at WARNING level or above during the block.
+        mock_get_raw.side_effect = [
+            _response(status_code=401),
+            _response(status_code=200, json_body=["booking"]),
+        ]
+        with self.assertNoLogs(level="WARNING"):
+            self.client.list_tables()
+
+    @mock.patch.object(RetainCloudClient, "get_raw")
+    def test_non_401_error_still_propagates_as_http_error(self, mock_get_raw):
+        # `get_raw` (used here since the switch away from the decorated `get`) carries no automatic
+        # `raise_for_status()` at all — confirms a non-401 failure still surfaces as a plain
+        # `HTTPError` for the caller (`component.py`'s `run()`) to convert into a `UserException`
+        # carrying the HTTP status, rather than being swallowed or mis-handled by this method.
+        mock_get_raw.return_value = _response(status_code=403)
+        with self.assertRaises(requests.HTTPError):
+            self.client.list_tables()
 
 
 class TestFetchTablePage(unittest.TestCase):

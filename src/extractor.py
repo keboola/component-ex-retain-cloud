@@ -98,13 +98,13 @@ def _coerces(declared_type: str, value) -> bool:
         try:
             int(value)
             return True
-        except TypeError, ValueError:
+        except (TypeError, ValueError):  # fmt: skip
             return False
     if declared_type == "Float":
         try:
             float(value)
             return True
-        except TypeError, ValueError:
+        except (TypeError, ValueError):  # fmt: skip
             return False
     if declared_type == "Bool":
         return value in _BOOL_TOKENS

@@ -14,15 +14,9 @@
       "options": {
         "async": {
           "label": "Load Tables",
-          "action": "list_tables",
-          "autoload": [
-            "parameters.environment",
-            "parameters.tenant",
-            "parameters.username",
-            "parameters.#password"
-          ]
+          "action": "list_tables"
         },
-        "tooltip": "Loaded from your tenant's table structure once the connection fields above are filled in. Reloads automatically if you change them."
+        "tooltip": "Click \"Load Tables\" to fetch the list of tables from your tenant. Requires the connection fields (environment, tenant, username, password) in the parent configuration to be filled in first."
       },
       "propertyOrder": 10
     },

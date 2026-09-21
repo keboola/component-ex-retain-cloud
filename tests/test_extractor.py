@@ -178,6 +178,28 @@ class TestFetchTableSingleCall(unittest.TestCase):
         result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
         self.assertFalse(result.pk_unique)
 
+    def test_pk_null_value_is_not_unique(self):
+        # Regression: a None/missing PK value used to count as "the one unique value" — a single
+        # row whose PK column is null made `pk_unique` True, which would let Storage declare a
+        # nullable column as the primary key. `pk_unique` must now require every observed PK value
+        # to be non-null, not just distinct.
+        rows = [
+            {
+                "booking_guid": None,
+                "booking_hours": 1,
+                "booking_rate": 1.0,
+                "booking_active": True,
+                "booking_createdon": "2026-01-01T00:00:00Z",
+                "booking_notes": "x",
+                "booking_meta": None,
+            },
+        ]
+        client = mock.Mock()
+        client.fetch_table_page.return_value = _envelope_response(row_count=1, rows=rows)
+
+        result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+        self.assertFalse(result.pk_unique)
+
     def test_int_column_downgraded_to_string_on_non_numeric_value(self):
         rows = [
             {
@@ -197,6 +219,71 @@ class TestFetchTableSingleCall(unittest.TestCase):
         downgraded = {name for name, ok in result.verified_columns.items() if not ok}
         self.assertIn("booking_hours", downgraded)
 
+    def test_int_column_downgraded_to_string_on_float_value(self):
+        # Regression: `int(1.0)` succeeds, but `_stringify` writes the literal text "1.0" for a
+        # float value — not a valid native INTEGER CSV literal — so a JSON float landing in an
+        # Int-declared column must still be downgraded to STRING.
+        rows = [
+            {
+                "booking_guid": "a",
+                "booking_hours": 1.0,
+                "booking_rate": 1.0,
+                "booking_active": True,
+                "booking_createdon": "2026-01-01T00:00:00Z",
+                "booking_notes": "x",
+                "booking_meta": None,
+            },
+        ]
+        client = mock.Mock()
+        client.fetch_table_page.return_value = _envelope_response(row_count=1, rows=rows)
+
+        result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+        downgraded = {name for name, ok in result.verified_columns.items() if not ok}
+        self.assertIn("booking_hours", downgraded)
+
+    def test_int_column_downgraded_to_string_on_bool_value(self):
+        # Regression: `int(True) == 1` succeeds, but `_stringify` writes the literal text "True" —
+        # not a valid native INTEGER CSV literal. A bool value only ever legitimately coerces into
+        # a Bool-declared column.
+        rows = [
+            {
+                "booking_guid": "a",
+                "booking_hours": True,
+                "booking_rate": 1.0,
+                "booking_active": True,
+                "booking_createdon": "2026-01-01T00:00:00Z",
+                "booking_notes": "x",
+                "booking_meta": None,
+            },
+        ]
+        client = mock.Mock()
+        client.fetch_table_page.return_value = _envelope_response(row_count=1, rows=rows)
+
+        result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+        downgraded = {name for name, ok in result.verified_columns.items() if not ok}
+        self.assertIn("booking_hours", downgraded)
+
+    def test_float_column_downgraded_to_string_on_bool_value(self):
+        # Same bool-rejection rule as above, but for a Float-declared column: `float(True) == 1.0`
+        # succeeds, but "True" is not a valid native FLOAT CSV literal.
+        rows = [
+            {
+                "booking_guid": "a",
+                "booking_hours": 1,
+                "booking_rate": True,
+                "booking_active": True,
+                "booking_createdon": "2026-01-01T00:00:00Z",
+                "booking_notes": "x",
+                "booking_meta": None,
+            },
+        ]
+        client = mock.Mock()
+        client.fetch_table_page.return_value = _envelope_response(row_count=1, rows=rows)
+
+        result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+        downgraded = {name for name, ok in result.verified_columns.items() if not ok}
+        self.assertIn("booking_rate", downgraded)
+
     def test_empty_table_still_produces_a_file(self):
         client = mock.Mock()
         client.fetch_table_page.return_value = _envelope_response(row_count=0, rows=[])
@@ -211,6 +298,21 @@ class TestFetchTableSingleCall(unittest.TestCase):
         client = mock.Mock()
         resp = mock.Mock(spec=requests.Response)
         resp.raw = io.BytesIO(b'{"key": "guid", "rowCount": 2, "rowsProcessed": 1, "data": [{"booking_guid": "a"')
+        client.fetch_table_page.return_value = resp
+
+        with self.assertRaises(ijson.JSONError):
+            fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+
+    def test_response_without_rowcount_key_raises_ijson_json_error(self):
+        # Regression: an envelope whose JSON body never carries a `rowCount` key AT ALL (distinct
+        # from the legitimate "empty table" case, `rowCount: 0`, covered by
+        # `test_empty_table_still_produces_a_file`) used to silently default `row_count_total` to
+        # 0, making a truncated first page look complete. It must now raise `ijson.JSONError`,
+        # same as a malformed body.
+        client = mock.Mock()
+        resp = mock.Mock(spec=requests.Response)
+        body = json.dumps({"key": "guid", "rowsProcessed": 1, "data": [{"booking_guid": "a"}]}).encode()
+        resp.raw = io.BytesIO(body)
         client.fetch_table_page.return_value = resp
 
         with self.assertRaises(ijson.JSONError):

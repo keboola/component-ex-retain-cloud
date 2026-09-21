@@ -14,6 +14,7 @@ import csv
 import json
 import logging
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -90,23 +91,25 @@ def build_table_schema(table: str, rich_fields: list[dict]) -> TableSchema_:
 
 
 _BOOL_TOKENS = {True, False, "true", "false", "True", "False", "1", "0"}
+# Matched against `_stringify(value)` — i.e. the exact text that will land in the CSV cell — not
+# against `value` itself, so verification guarantees the *emitted representation* is a valid
+# literal for the native type Storage will declare, not merely that Python can cast it.
+_INT_LITERAL_RE = re.compile(r"^-?\d+$")
+_FLOAT_LITERAL_RE = re.compile(r"^-?\d+(\.\d+)?([eE][+-]?\d+)?$")
 
 
 def _coerces(declared_type: str, value: Any) -> bool:
     if value is None:
         return True
+    if isinstance(value, bool):
+        # `int(True) == 1` and `float(True) == 1.0` both succeed, but `_stringify` writes the
+        # literal text "True"/"False" for a bool — not a valid INTEGER/FLOAT CSV literal. A bool
+        # value only ever legitimately coerces into a Bool column.
+        return declared_type == "Bool" and value in _BOOL_TOKENS
     if declared_type == "Int":
-        try:
-            int(value)
-            return True
-        except (TypeError, ValueError):  # fmt: skip
-            return False
+        return bool(_INT_LITERAL_RE.match(_stringify(value)))
     if declared_type == "Float":
-        try:
-            float(value)
-            return True
-        except (TypeError, ValueError):  # fmt: skip
-            return False
+        return bool(_FLOAT_LITERAL_RE.match(_stringify(value)))
     if declared_type == "Bool":
         return value in _BOOL_TOKENS
     return True
@@ -153,8 +156,9 @@ def _stream_to_csv(response: requests.Response, schema: TableSchema_, csv_path: 
     declared_by_name = {c.name: c.declared_type for c in schema.columns}
     verified = {c.name: True for c in schema.columns if c.declared_type in _VERIFY_TYPES}
     pk_values: set = set()
+    pk_has_null = False
     row_count = 0
-    row_count_total = 0
+    row_count_total: int | None = None
     schema_drift_logged = False
 
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
@@ -184,9 +188,24 @@ def _stream_to_csv(response: requests.Response, schema: TableSchema_, csv_path: 
                     )
             writer.writerow([_stringify(row.get(name)) for name in fieldnames])
             if schema.pk_column:
-                pk_values.add(row.get(schema.pk_column))
+                pk_value = row.get(schema.pk_column)
+                if pk_value is None:
+                    pk_has_null = True
+                else:
+                    pk_values.add(pk_value)
 
-    pk_unique = schema.pk_column is not None and len(pk_values) == row_count
+    if row_count_total is None:
+        # The envelope never carried a `rowCount` sibling scalar at all — not "zero rows", which
+        # would still yield a `("meta", 0)` event, but the key/event never firing. Treating that as
+        # "0 rows expected" (the old default) would make `fetch_table`'s `row_count >= row_count_total`
+        # trivially true for any response, silently accepting a truncated first page as the whole
+        # table. Raising here reuses the existing `ijson.JSONError` → `UserException` contract
+        # (`component.py`'s `_process_table` handler) instead of inventing a new failure mode.
+        raise ijson.JSONError(f"Table {schema.table}: response envelope did not include a 'rowCount' value.")
+
+    # A null/missing PK value must never be silently treated as "the one unique value" — Storage
+    # would then declare a nullable column as the primary key, which upserts can't handle safely.
+    pk_unique = schema.pk_column is not None and not pk_has_null and len(pk_values) == row_count
     return (
         FetchResult(scratch_path=csv_path, row_count=row_count, pk_unique=pk_unique, verified_columns=verified),
         row_count_total,

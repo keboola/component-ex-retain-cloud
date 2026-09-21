@@ -99,6 +99,22 @@ class TestListTablesSyncAction(_SyncActionTestCase):
             comp.list_tables()
 
     @mock.patch("component.RetainCloudClient")
+    def test_label_entry_missing_name_raises_user_exception(self, mock_client_cls):
+        # Regression: `row["name"]` is a response-schema assumption, not an HTTP failure — a label
+        # entry from `client.list_table_labels()` missing the `name` field used to raise a raw
+        # `KeyError` here, which would escape as an unhandled exit-code-2 error instead of a clean,
+        # user-visible `UserException`.
+        client = mock_client_cls.return_value
+        client.list_tables.return_value = ["booking"]
+        client.list_table_labels.return_value = [{"alias": "Bookings"}]  # no "name" key
+        comp = self._component(ROOT_PARAMS)
+
+        with self.assertRaises(UserException) as ctx:
+            comp.list_tables()
+
+        self.assertEqual(str(ctx.exception), "Retain Cloud returned a table label entry without a 'name' field.")
+
+    @mock.patch("component.RetainCloudClient")
     def test_post_auth_request_failure_raises_user_exception(self, mock_client_cls):
         # Regression for the error-handling gate finding: `client.list_tables()`/
         # `client.list_table_labels()` used to be called with no try/except at all here, so a

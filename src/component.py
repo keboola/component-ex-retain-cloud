@@ -339,6 +339,12 @@ class Component(ComponentBase):
             # the config UI, rather than the same clean `UserException` `run()` already gives for
             # the equivalent failure.
             raise UserException(self._describe_request_failure("Failed to load the table list", e)) from e
+        except KeyError as e:
+            # `row["name"]` above is a response-schema assumption, not an HTTP failure — a label
+            # entry missing `name` must still fail as a clean `UserException` (exit 1), not escape
+            # this `try` (KeyError isn't a `RequestException`) to `__main__`'s bare `except
+            # Exception` (exit 2, "unexpected internal bug").
+            raise UserException("Retain Cloud returned a table label entry without a 'name' field.") from e
         return [{"value": name, "label": labels_by_name.get(name) or name} for name in table_names]
 
 

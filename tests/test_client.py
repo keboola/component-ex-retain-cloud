@@ -78,6 +78,22 @@ class TestRetainCloudClientAuth(unittest.TestCase):
             self.client.authenticate()
 
     @mock.patch.object(RetainCloudClient, "post_raw")
+    def test_authenticate_raises_user_exception_on_malformed_token_body(self, mock_post_raw):
+        # Regression: a `200` response whose body isn't actually a valid `Bearer <jwt>` (e.g. a
+        # maintenance page, or a vendor API contract change) used to call `decode_jwt_exp` outside
+        # any try/except, so a raw `IndexError`/`ValueError`/`KeyError`/`TypeError` propagated
+        # straight out of `authenticate()` as an "unexpected internal bug" (exit 2) instead of the
+        # user-fixable `UserException` (exit 1) this actually is.
+        from keboola.component.exceptions import UserException
+
+        bad_token_body = "Bearer not-a-real-token"
+        mock_post_raw.return_value = _response(status_code=200, text=bad_token_body)
+        with self.assertRaises(UserException) as ctx:
+            self.client.authenticate()
+        # Never leaks the raw (bogus-but-token-shaped) body into the user-facing message.
+        self.assertNotIn(bad_token_body, str(ctx.exception))
+
+    @mock.patch.object(RetainCloudClient, "post_raw")
     def test_authenticate_raises_user_exception_on_retries_exhausted(self, mock_post_raw):
         # `HttpClient`'s retry adapter uses `raise_on_status=True`, so a sustained 502/503 that
         # exhausts retries raises `requests.exceptions.RetryError` from *within* `post_raw` itself

@@ -21,7 +21,7 @@ secrets.json
 secrets_badpassword.json
 tests/functional/*/source/data/config.secrets.json
 tests/functional/*/source/data/out/
-tests/functional/*/source/data/in/
+tests/functional/*/source/data/in/tables/
 
 # component-factory local build artifacts (never committed)
 docs/superpowers/*-lifecycle.md

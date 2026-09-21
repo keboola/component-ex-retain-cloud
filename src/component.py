@@ -330,8 +330,15 @@ class Component(ComponentBase):
         # parameters (table/load_type/page_size) are simply ignored by RootConfig's extra="ignore".
         cfg = RootConfig(**self.configuration.parameters)
         client = self._build_authenticated_client(cfg)
-        table_names = client.list_tables()
-        labels_by_name = {row["name"]: row.get("alias") for row in client.list_table_labels()}
+        try:
+            table_names = client.list_tables()
+            labels_by_name = {row["name"]: row.get("alias") for row in client.list_table_labels()}
+        except requests.exceptions.RequestException as e:
+            # Without this, a non-401 HTTP failure here (or a retries-exhausted/connection outage)
+            # would leak `HttpClient`'s raw exception message — including the internal API URL — to
+            # the config UI, rather than the same clean `UserException` `run()` already gives for
+            # the equivalent failure.
+            raise UserException(self._describe_request_failure("Failed to load the table list", e)) from e
         return [{"value": name, "label": labels_by_name.get(name) or name} for name in table_names]
 
 
@@ -339,8 +346,12 @@ if __name__ == "__main__":
     try:
         comp = Component()
         comp.execute_action()
-    except UserException:
-        logger.exception("Component failed with a user error")
+    except UserException as e:
+        # No `exc_info` here, deliberately: exit-1 messages are shown directly to the user, and a
+        # `UserException` is by definition a clean, already-understood failure — a full stack trace
+        # adds noise, not information. `logger.exception(...)` (full traceback) stays reserved for
+        # the generic `except Exception` branch below, where a trace is the only diagnostic we have.
+        logger.error("Component failed with a user error: %s", e)
         sys.exit(1)
     except Exception:
         logger.exception("Component failed with an unexpected error")

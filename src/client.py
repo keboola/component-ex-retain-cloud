@@ -20,6 +20,14 @@ ENVIRONMENT_HOSTS: dict[str, str] = {
 
 _TOKEN_REFRESH_MARGIN_SECONDS = 300
 
+# (connect, read) seconds, applied to every call this client makes (see `_request_raw` override
+# below). Neither `HttpClient` nor `requests` sets a default, so without this an unreachable or
+# hanging host blocks the job forever — and a connection that never completes never reaches the
+# retry adapter either. The read side is deliberately generous: for a `stream=True` response
+# (`fetch_table_page`), `requests`' read timeout is the gap between individual chunks, not the
+# total download time, so this stays safe even for the largest tables (spec §9 risk #1).
+_DEFAULT_TIMEOUT: tuple[float, float] = (10.0, 60.0)
+
 
 def decode_jwt_exp(token_body: str) -> int:
     """Read the `exp` claim out of a `Bearer <jwt>` string, without verifying its signature.
@@ -50,6 +58,11 @@ class RetainCloudClient(HttpClient):
         self._username = username
         self._password = password
         self._token_exp = 0
+
+    def _request_raw(self, method: str, endpoint_path: str | None = None, **kwargs) -> requests.Response:
+        """Apply `_DEFAULT_TIMEOUT` to every request this client makes, unless a caller overrides it."""
+        kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
+        return super()._request_raw(method, endpoint_path, **kwargs)
 
     def authenticate(self) -> None:
         """POST the credentials to `IntegrationApi/token` and store the resulting bearer token.
@@ -84,7 +97,18 @@ class RetainCloudClient(HttpClient):
             raise UserException("Retain Cloud authentication failed: API unavailable after retries.") from e
 
         token_body = response.text.strip()
-        self._token_exp = decode_jwt_exp(token_body)
+        try:
+            self._token_exp = decode_jwt_exp(token_body)
+        except (IndexError, ValueError, KeyError, TypeError) as e:
+            # A `200` response whose body isn't a valid `Bearer <jwt>` (e.g. a maintenance page, or
+            # a vendor contract change) must still fail as a `UserException` (exit 1), not leak a
+            # raw `IndexError`/`ValueError`/`KeyError` up to `__main__`'s generic exit-2 handler —
+            # this is a user-visible "the API returned something unexpected" condition, not a bug
+            # in this component. Never includes `token_body` itself in the message: it is, or at
+            # least resembles, a credential-bearing token.
+            raise UserException(
+                "Retain Cloud authentication succeeded but returned an unrecognized token format."
+            ) from e
         self.update_auth_header({"Authorization": token_body}, overwrite=True)
 
     def _ensure_token(self) -> None:

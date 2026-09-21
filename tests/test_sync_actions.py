@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import requests
 from keboola.component.exceptions import UserException
 
 from component import Component
@@ -96,6 +97,24 @@ class TestListTablesSyncAction(_SyncActionTestCase):
         comp = self._component(ROOT_PARAMS)
         with self.assertRaises(UserException):
             comp.list_tables()
+
+    @mock.patch("component.RetainCloudClient")
+    def test_post_auth_request_failure_raises_user_exception(self, mock_client_cls):
+        # Regression for the error-handling gate finding: `client.list_tables()`/
+        # `client.list_table_labels()` used to be called with no try/except at all here, so a
+        # non-401 HTTP failure (or a `RetryError` from exhausted retries) leaked `HttpClient`'s raw
+        # `requests` exception message — including the internal API URL — straight to the config
+        # UI, instead of the clean `UserException` `run()` already gives for the equivalent
+        # failure. Authentication itself succeeds; the failure happens on the discovery call.
+        client = mock_client_cls.return_value
+        client.authenticate.return_value = None
+        client.list_tables.side_effect = requests.exceptions.RetryError("too many 503 retries")
+        comp = self._component(ROOT_PARAMS)
+
+        with self.assertRaises(UserException) as ctx:
+            comp.list_tables()
+
+        self.assertNotIn("https://", str(ctx.exception))
 
 
 if __name__ == "__main__":

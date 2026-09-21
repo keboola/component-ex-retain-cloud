@@ -1,0 +1,208 @@
+import csv
+import io
+import json
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import requests
+from keboola.component.dao import SupportedDataTypes
+
+from extractor import build_table_schema, fetch_table
+
+RICH_FIELDS_BOOKING = [
+    {"name": "booking_guid", "dataType": "ID"},
+    {"name": "booking_hours", "dataType": "Int"},
+    {"name": "booking_rate", "dataType": "Float"},
+    {"name": "booking_active", "dataType": "Bool"},
+    {"name": "booking_createdon", "dataType": "DateTime"},
+    {"name": "booking_notes", "dataType": "String"},
+    {"name": "booking_meta", "dataType": "Unknown"},
+]
+
+
+def _envelope_response(row_count: int, rows: list[dict]) -> requests.Response:
+    body = json.dumps({"key": "guid", "rowCount": row_count, "rowsProcessed": len(rows), "data": rows}).encode()
+    resp = mock.Mock(spec=requests.Response)
+    resp.raw = io.BytesIO(body)
+    return resp
+
+
+class TestBuildTableSchema(unittest.TestCase):
+    def test_maps_datetime_to_timestamp(self):
+        schema = build_table_schema("booking", RICH_FIELDS_BOOKING)
+        col = next(c for c in schema.columns if c.name == "booking_createdon")
+        self.assertEqual(col.base_type, SupportedDataTypes.TIMESTAMP)
+
+    def test_detects_pk_column(self):
+        schema = build_table_schema("booking", RICH_FIELDS_BOOKING)
+        self.assertEqual(schema.pk_column, "booking_guid")
+
+    def test_no_pk_column_when_guid_field_absent(self):
+        fields = [f for f in RICH_FIELDS_BOOKING if f["name"] != "booking_guid"]
+        schema = build_table_schema("booking", fields)
+        self.assertIsNone(schema.pk_column)
+
+    def test_bool_int_float_start_as_native_candidates(self):
+        schema = build_table_schema("booking", RICH_FIELDS_BOOKING)
+        by_name = {c.name: c for c in schema.columns}
+        self.assertEqual(by_name["booking_hours"].base_type, SupportedDataTypes.INTEGER)
+        self.assertEqual(by_name["booking_rate"].base_type, SupportedDataTypes.FLOAT)
+        self.assertEqual(by_name["booking_active"].base_type, SupportedDataTypes.BOOLEAN)
+
+    def test_id_string_unknown_map_to_string(self):
+        schema = build_table_schema("booking", RICH_FIELDS_BOOKING)
+        by_name = {c.name: c for c in schema.columns}
+        self.assertEqual(by_name["booking_guid"].base_type, SupportedDataTypes.STRING)
+        self.assertEqual(by_name["booking_notes"].base_type, SupportedDataTypes.STRING)
+        self.assertEqual(by_name["booking_meta"].base_type, SupportedDataTypes.STRING)
+
+
+class TestFetchTableSingleCall(unittest.TestCase):
+    def setUp(self):
+        self.schema = build_table_schema("booking", RICH_FIELDS_BOOKING)
+        self.scratch_dir = Path("/tmp/ex-retain-cloud-test")
+        self.scratch_dir.mkdir(parents=True, exist_ok=True)
+
+    def test_single_call_when_first_call_covers_the_whole_table(self):
+        rows = [
+            {
+                "booking_guid": "a",
+                "booking_hours": 8,
+                "booking_rate": 1.5,
+                "booking_active": True,
+                "booking_createdon": "2026-01-01T00:00:00Z",
+                "booking_notes": "x",
+                "booking_meta": None,
+            },
+            {
+                "booking_guid": "b",
+                "booking_hours": 4,
+                "booking_rate": 2.0,
+                "booking_active": False,
+                "booking_createdon": "2026-01-02T00:00:00Z",
+                "booking_notes": "y",
+                "booking_meta": {"k": 1},
+            },
+        ]
+        client = mock.Mock()
+        client.fetch_table_page.return_value = _envelope_response(row_count=2, rows=rows)
+
+        result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+
+        client.fetch_table_page.assert_called_once_with("booking", 20000)
+        self.assertEqual(result.row_count, 2)
+        self.assertTrue(result.pk_unique)
+        content = result.scratch_path.read_text()
+        self.assertIn("a,8,1.5,True,2026-01-01T00:00:00Z,x,", content)
+        self.assertNotIn("booking_guid", content)  # headerless — no header row
+        # nested object serialized as compact JSON — parsed via csv.reader rather than a raw
+        # substring match, since a well-formed CSV writer correctly RFC4180-quotes a field that
+        # itself contains double quotes (doubling them), so the raw bytes are `"{""k"":1}"`.
+        written_rows = list(csv.reader(io.StringIO(content)))
+        self.assertEqual(written_rows[1][-1], '{"k":1}')
+
+    def test_second_call_issued_when_first_call_is_short(self):
+        first_rows = [
+            {
+                "booking_guid": "a",
+                "booking_hours": 1,
+                "booking_rate": 1.0,
+                "booking_active": True,
+                "booking_createdon": "2026-01-01T00:00:00Z",
+                "booking_notes": "x",
+                "booking_meta": None,
+            }
+        ]
+        second_rows = first_rows + [
+            {
+                "booking_guid": "b",
+                "booking_hours": 2,
+                "booking_rate": 2.0,
+                "booking_active": False,
+                "booking_createdon": "2026-01-02T00:00:00Z",
+                "booking_notes": "y",
+                "booking_meta": None,
+            },
+            {
+                "booking_guid": "c",
+                "booking_hours": 3,
+                "booking_rate": 3.0,
+                "booking_active": True,
+                "booking_createdon": "2026-01-03T00:00:00Z",
+                "booking_notes": "z",
+                "booking_meta": None,
+            },
+        ]
+        client = mock.Mock()
+        client.fetch_table_page.side_effect = [
+            _envelope_response(row_count=3, rows=first_rows),
+            _envelope_response(row_count=3, rows=second_rows),
+        ]
+
+        result = fetch_table(client, "booking", self.schema, page_size=1, scratch_dir=self.scratch_dir)
+
+        self.assertEqual(client.fetch_table_page.call_count, 2)
+        second_call_args = client.fetch_table_page.call_args_list[1]
+        self.assertEqual(second_call_args.args[0], "booking")
+        self.assertGreaterEqual(second_call_args.args[1], 3)  # rowCount + margin, not the raw rowCount
+        self.assertEqual(result.row_count, 3)  # final result reflects the SECOND call only
+        content = result.scratch_path.read_text()
+        self.assertEqual(content.count("\n"), 3)  # not 1 (first) + 3 (second) — first call discarded
+
+    def test_pk_not_unique_falls_back_to_no_pk(self):
+        rows = [
+            {
+                "booking_guid": "dup",
+                "booking_hours": 1,
+                "booking_rate": 1.0,
+                "booking_active": True,
+                "booking_createdon": "2026-01-01T00:00:00Z",
+                "booking_notes": "x",
+                "booking_meta": None,
+            },
+            {
+                "booking_guid": "dup",
+                "booking_hours": 2,
+                "booking_rate": 2.0,
+                "booking_active": False,
+                "booking_createdon": "2026-01-02T00:00:00Z",
+                "booking_notes": "y",
+                "booking_meta": None,
+            },
+        ]
+        client = mock.Mock()
+        client.fetch_table_page.return_value = _envelope_response(row_count=2, rows=rows)
+
+        result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+        self.assertFalse(result.pk_unique)
+
+    def test_int_column_downgraded_to_string_on_non_numeric_value(self):
+        rows = [
+            {
+                "booking_guid": "a",
+                "booking_hours": "DELIVERED",
+                "booking_rate": 1.0,
+                "booking_active": True,
+                "booking_createdon": "2026-01-01T00:00:00Z",
+                "booking_notes": "x",
+                "booking_meta": None,
+            },
+        ]
+        client = mock.Mock()
+        client.fetch_table_page.return_value = _envelope_response(row_count=1, rows=rows)
+
+        result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+        downgraded = {name for name, ok in result.verified_columns.items() if not ok}
+        self.assertIn("booking_hours", downgraded)
+
+    def test_empty_table_still_produces_a_file(self):
+        client = mock.Mock()
+        client.fetch_table_page.return_value = _envelope_response(row_count=0, rows=[])
+        result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+        self.assertEqual(result.row_count, 0)
+        self.assertTrue(result.scratch_path.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

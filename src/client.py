@@ -1,0 +1,129 @@
+"""HTTP client for the Retain Cloud DataAccessAPI."""
+
+import base64
+import json
+import logging
+import time
+
+import requests
+from keboola.component.exceptions import UserException
+from keboola.http_client import HttpClient
+
+logger = logging.getLogger(__name__)
+
+ENVIRONMENT_HOSTS: dict[str, str] = {
+    "us": "us.retaincloud.com",
+    "eu": "eu.retaincloud.com",
+    "uk": "app.retaincloud.com",  # NOT uk.retaincloud.com — that hostname does not resolve
+    "aus": "aus.retaincloud.com",
+}
+
+_TOKEN_REFRESH_MARGIN_SECONDS = 300
+
+
+def decode_jwt_exp(token_body: str) -> int:
+    """Read the `exp` claim out of a `Bearer <jwt>` string, without verifying its signature.
+
+    We trust our own freshly-issued token — this is a local read of a claim we already own, not
+    validation of a token from an untrusted third party — so no JWT library is needed for this.
+    """
+    jwt = token_body.removeprefix("Bearer ").strip()
+    payload_segment = jwt.split(".")[1]
+    padding = "=" * (-len(payload_segment) % 4)
+    payload = json.loads(base64.urlsafe_b64decode(payload_segment + padding))
+    return int(payload["exp"])
+
+
+class RetainCloudClient(HttpClient):
+    def __init__(self, environment: str, tenant: str, username: str, password: str):
+        host = ENVIRONMENT_HOSTS[environment]
+        base_url = f"https://{host}/DataAccessAPI/{tenant}/api/"
+        super().__init__(
+            base_url=base_url,
+            max_retries=5,
+            backoff_factor=1.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+        )
+        self._host = host
+        self._environment = environment
+        self._tenant = tenant
+        self._username = username
+        self._password = password
+        self._token_exp = 0
+
+    def authenticate(self) -> None:
+        """POST the credentials to `IntegrationApi/token` and store the resulting bearer token.
+
+        Never logs `self._password` or the response body — only the HTTP status on failure.
+        """
+        token_url = f"https://{self._host}/IntegrationApi/token"
+        response = self.post_raw(
+            token_url,
+            is_absolute_path=True,
+            ignore_auth=True,
+            json={
+                "useremail": self._username,
+                "userpassword": self._password,
+                "environment": self._environment,
+                "tenant": self._tenant,
+            },
+        )
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "unknown"
+            raise UserException(f"Retain Cloud authentication failed (HTTP {status}).") from e
+
+        token_body = response.text.strip()
+        self._token_exp = decode_jwt_exp(token_body)
+        self.update_auth_header({"Authorization": token_body}, overwrite=True)
+
+    def _ensure_token(self) -> None:
+        if self._token_exp - time.time() < _TOKEN_REFRESH_MARGIN_SECONDS:
+            self.authenticate()
+
+    def _get_with_reauth(self, path: str, **kwargs):
+        try:
+            return self.get(path, **kwargs)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 401:
+                self.authenticate()
+                return self.get(path, **kwargs)
+            raise
+
+    def list_tables(self) -> list[str]:
+        self._ensure_token()
+        return self._get_with_reauth("structure")
+
+    def list_table_labels(self) -> list[dict]:
+        self._ensure_token()
+        return self._get_with_reauth("structure/tablestructure")
+
+    def get_table_schema(self, table: str) -> list[dict]:
+        self._ensure_token()
+        return self._get_with_reauth("structure/richfieldstructure", params={"table": table})
+
+    def fetch_table_page(self, table: str, page_size: int) -> requests.Response:
+        """Issue one `paging/paged` call and return the raw, streamable response.
+
+        The caller (`extractor.py`) is responsible for consuming `response.raw` with `ijson` — this
+        method never reads the body itself, so the "one/two calls per table" contract (spec §6)
+        stays entirely in the caller's hands.
+        """
+        self._ensure_token()
+        params = {"pageSize": page_size, "sequential": "true"}
+        path = f"tableaccess/{table}/paging/paged"
+        response = self.post_raw(path, params=params, stream=True)
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 401:
+                self.authenticate()
+                response = self.post_raw(path, params=params, stream=True)
+                response.raise_for_status()
+            else:
+                raise
+        # requests does not auto-decompress `response.raw` the way it does `.content`/`.json()` —
+        # without this, a gzip-compressed body would be handed to ijson as garbled raw bytes.
+        response.raw.decode_content = True
+        return response

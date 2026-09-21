@@ -1,102 +1,117 @@
-"""
-Template Component main class.
+"""Thin Component orchestrator for keboola.ex-retain-cloud.
 
+Each row selects exactly one table (spec §2/§5's config-rows convention) — so `run()` is a single
+straight-line sequence with no per-table loop and no partial-failure bookkeeping: a table failure
+fails this row's job outright, which the platform already isolates from every other row.
 """
 
-import csv
 import logging
+import shutil
 import sys
-from datetime import UTC, datetime
+from pathlib import Path
 
-from keboola.component.base import ComponentBase
+import requests
+from keboola.component.base import ComponentBase, sync_action
 from keboola.component.exceptions import UserException
+from keboola.component.table_schema import FieldSchema, TableSchema
 
-from configuration import Configuration
+from client import RetainCloudClient
+from configuration import Configuration, RootConfig
+from extractor import TableSchema_, build_table_schema, fetch_table
 
 logger = logging.getLogger(__name__)
 
+_SCRATCH_DIR = Path("/tmp/ex-retain-cloud")
+
 
 class Component(ComponentBase):
-    """
-    Extends base class for general Python components. Initializes the CommonInterface
-    and performs configuration validation.
-
-    For easier debugging the data folder is picked up by default from `../data` path,
-    relative to working directory.
-
-    If `debug` parameter is present in the `config.json`, the default logger is set to verbose DEBUG mode.
-    """
-
     def __init__(self):
         super().__init__()
 
-    def run(self):
-        """
-        Main execution code
-        """
+    def run(self) -> None:
+        cfg = Configuration(**self.configuration.parameters)
+        client = self._build_authenticated_client(cfg)
 
-        # ####### EXAMPLE TO REMOVE
-        # check for missing configuration parameters
-        params = Configuration(**self.configuration.parameters)
+        if cfg.table not in set(client.list_tables()):
+            raise UserException(f"Table '{cfg.table}' is no longer present in this tenant's structure.")
 
-        # Access parameters in configuration
-        if params.print_hello:
-            logger.info("Hello World")
+        try:
+            self._process_table(client, cfg)
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "unknown"
+            raise UserException(f"Failed to fetch table '{cfg.table}' (HTTP {status}).") from e
 
-        # get input table definitions
-        input_tables = self.get_input_tables_definitions()
-        for table in input_tables:
-            logger.info("Received input table: %s with path: %s", table.name, table.full_path)
+    def _build_authenticated_client(self, cfg: RootConfig) -> RetainCloudClient:
+        client = RetainCloudClient(
+            environment=cfg.environment.value,
+            tenant=cfg.tenant,
+            username=cfg.username,
+            password=cfg.password.get_secret_value(),
+        )
+        client.authenticate()
+        return client
 
-        if len(input_tables) == 0:
-            raise UserException("No input tables found")
+    def _process_table(self, client: RetainCloudClient, cfg: Configuration) -> None:
+        rich_fields = client.get_table_schema(cfg.table)
+        schema = build_table_schema(cfg.table, rich_fields)
+        result = fetch_table(client, cfg.table, schema, cfg.page_size, _SCRATCH_DIR)
 
-        # get last state data/in/state.json from previous run
-        previous_state = self.get_state_file()
-        logger.info(previous_state.get("some_parameter"))
+        incremental_for_table = cfg.incremental and result.pk_unique
+        if cfg.incremental and not result.pk_unique:
+            logger.warning(
+                "Table %s: Incremental Load was requested but the primary key did not verify "
+                "unique this run — falling back to full load for this run.",
+                cfg.table,
+            )
 
-        # Create output table (Table definition - just metadata)
-        table = self.create_out_table_definition("output.csv", incremental=True, primary_key=["timestamp"])
+        # `create_out_table_definition_from_schema`'s `incremental` kwarg is VERIFIED (not
+        # inferred) against the installed keboola-component library:
+        # `uv run python -c "import inspect; from keboola.component.base import ComponentBase;
+        # print(inspect.signature(ComponentBase.create_out_table_definition_from_schema))"` reports
+        # `(self, table_schema, is_sliced=False, destination='', incremental: bool = None,
+        # enclosure='"', delimiter=',', delete_where=None)` — `incremental` is real.
+        table_def = self.create_out_table_definition_from_schema(
+            self._to_output_schema(schema, result.pk_unique),
+            incremental=incremental_for_table,
+        )
+        Path(table_def.full_path).parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(result.scratch_path), table_def.full_path)
+        self.write_manifest(table_def)
 
-        # get file path of the table (data/out/tables/Features.csv)
-        out_table_path = table.full_path
-        logger.info(out_table_path)
+    @staticmethod
+    def _to_output_schema(schema: TableSchema_, pk_unique: bool) -> TableSchema:
+        # The PK is declared ONLY when this run's uniqueness check passed (spec §6/§7 case 13) —
+        # for BOTH full and incremental load. Declaring a non-unique PK would make Storage
+        # deduplicate on the declared key at import time, silently dropping a row every run, on
+        # the component's DEFAULT (full_load) path — not just the incremental one. `pk_unique` is
+        # already False whenever `schema.pk_column` is None (extractor.py's `_stream_to_csv`
+        # computes `pk_unique = schema.pk_column is not None and len(pk_values) == row_count`), so
+        # the explicit `schema.pk_column` check below is redundant at runtime — it's here purely to
+        # narrow `str | None` to `str` for the type checker.
+        primary_keys = [schema.pk_column] if pk_unique and schema.pk_column else None
+        fields = [FieldSchema(name=c.name, base_type=c.base_type, nullable=True) for c in schema.columns]
+        return TableSchema(name=schema.table, fields=fields, primary_keys=primary_keys)
 
-        # Add timestamp column and save into out_table_path
-        input_table = input_tables[0]
-        with (
-            open(input_table.full_path) as inp_file,
-            open(table.full_path, mode="w", encoding="utf-8", newline="") as out_file,
-        ):
-            reader = csv.DictReader(inp_file)
+    @sync_action("testConnection")
+    def test_connection(self) -> None:
+        cfg = RootConfig(**self.configuration.parameters)
+        self._build_authenticated_client(cfg)
 
-            columns = list(reader.fieldnames)
-            # append timestamp
-            columns.append("timestamp")
-
-            # write result with column added
-            writer = csv.DictWriter(out_file, fieldnames=columns)
-            writer.writeheader()
-            for in_row in reader:
-                in_row["timestamp"] = datetime.now(tz=UTC).isoformat()
-                writer.writerow(in_row)
-
-        # Save table manifest (output.csv.manifest) from the Table definition
-        self.write_manifest(table)
-
-        # Write new state - will be available next run
-        self.write_state_file({"some_state_parameter": "value"})
-
-        # ####### EXAMPLE TO REMOVE END
+    @sync_action("list_tables")
+    def list_tables(self) -> list[dict]:
+        # Deliberately RootConfig, not Configuration — a fresh row may not have `table` set yet
+        # (spec §6's "partial instantiation" fix). Any row-level keys present in the merged
+        # parameters (table/load_type/page_size) are simply ignored by RootConfig's extra="ignore".
+        cfg = RootConfig(**self.configuration.parameters)
+        client = self._build_authenticated_client(cfg)
+        table_names = client.list_tables()
+        labels_by_name = {row["name"]: row.get("alias") for row in client.list_table_labels()}
+        return [{"value": name, "label": labels_by_name.get(name) or name} for name in table_names]
 
 
-"""
-        Main entrypoint
-"""
 if __name__ == "__main__":
     try:
         comp = Component()
-        # this triggers the run method by default and is controlled by the configuration.action parameter
         comp.execute_action()
     except UserException:
         logger.exception("Component failed with a user error")

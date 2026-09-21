@@ -1,17 +1,28 @@
 # keboola.ex-retain-cloud Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Revision note (same day):** this plan was rewritten after the spec's config shape changed from
+> a single config with a `tables[]` multi-select to **config rows, one row per table**. If you are
+> resuming a partially-executed run of the *previous* version of this plan, treat everything below
+> as authoritative and re-check any already-completed task against it — the previous version's
+> `Configuration` model (with `tables: list[str]`) and `run()` orchestration (a per-table loop) are
+> both superseded.
 
 **Goal:** Build the `keboola.ex-retain-cloud` extractor end-to-end on the `initial-implementation`
-branch: a Pydantic config, a Retain Cloud DataAccessAPI client, a streaming per-table fetch/typing
-algorithm, two sync actions, and a thin `run()` orchestrator — matching the committed design spec.
+branch: a root config model + a row config model, a Retain Cloud DataAccessAPI client, a streaming
+single-table fetch/typing algorithm, two sync actions (one root-level, one row-level), and a thin
+`run()` orchestrator that handles exactly the one table its row selected — matching the committed
+design spec.
 
 **Architecture:** A `RetainCloudClient(keboola.http_client.HttpClient)` owns auth (JWT lifecycle,
 environment→host map) and every HTTP call. A separate `extractor` module owns the per-table
 streaming fetch (`ijson` over `POST .../paging/paged`), the `/tmp`-staged CSV write, per-column
-native-type verification, and PK-uniqueness detection. `component.py` stays a thin orchestrator:
-parse config → authenticate → validate selected tables → loop tables (schema → fetch → move →
-manifest) → summarize failures.
+native-type verification, and PK-uniqueness detection — unchanged by the config-shape revision,
+since it always operated on one table at a time. `component.py` stays a thin orchestrator: parse
+the merged config → authenticate → validate the row's one table → fetch it (schema → fetch → move →
+manifest) → done. There is no per-table loop and no partial-failure bookkeeping — a table failure
+now fails this row's job outright, which the platform already isolates from every other row.
 
 **Tech Stack:** Python 3.14, `keboola-component`, `keboola-http-client` (already a dependency),
 Pydantic v2, `ijson` (new dependency), standard library `csv`/`base64`/`json`. Tests: `pytest`,
@@ -31,12 +42,21 @@ VCR functional tests are a separate delegated task (Task 8).
   cannot leak it.
 - `environment` → host is an explicit `dict[str, str]` map (`us`/`eu`/`aus` → `<env>.retaincloud.com`,
   `uk` → `app.retaincloud.com`) — never `f"https://{environment}.retaincloud.com"` (spec §3).
+- **Two Pydantic models, matching the root/row schema split exactly (spec §6):** `RootConfig`
+  (`environment`, `tenant`, `username`, `password`) with `extra="ignore"` — used for partial
+  instantiation by sync actions that don't have (or don't need) the row's fields — and
+  `Configuration(RootConfig)` (adds `table`, `load_type`, `page_size`) with `extra="forbid"` — used
+  only by `run()`, where the platform guarantees a fully merged, fully valid row config. `load_type`
+  is a REAL field on `Configuration` (row-level, default `full_load`) — it is **not** internal or
+  omitted; only `fetch_mode` (`full_fetch`) is a pure code constant, never a model field at all.
 - Every `paging/paged` response streams into a `/tmp` scratch file; a file only lands under
-  `/data/out/tables/` after that table's fetch fully succeeds (spec §6 staging rule — this is a
+  `/data/out/tables/` after the row's fetch fully succeeds (spec §6 staging rule — this is a
   correctness requirement, not a style preference: `output-mapping.md` uploads everything under
   `/data/out/tables/` regardless of the output-mapping config).
-- `load_type` is a real, user-facing Pydantic field (`full_load` default); `fetch_mode` is an
-  internal-only constant (`full_fetch`), never a schema field (spec §2/§5).
+- A table-level failure (missing from `structure`, `403`/`404`/exhausted-retry `5xx` on
+  `richfieldstructure` or `paging/paged`) raises `UserException` in `run()` — it does **not** log a
+  warning and continue. There is nothing else in this row's job to continue to; other tables' rows
+  are separate container executions, already isolated by the platform.
 - Manifests are built via `ComponentBase.create_out_table_definition_from_schema(TableSchema(...))`
   (verified in the installed `keboola-component` library, not assumed) — CSVs are written
   **headerless** (no `csv.DictWriter.writeheader()` call), matching that method's own default
@@ -46,20 +66,20 @@ VCR functional tests are a separate delegated task (Task 8).
 
 ---
 
-### Task 1: Configuration model
+### Task 1: Configuration models — `RootConfig` and `Configuration`
 
 **Files:**
 - Modify: `src/configuration.py` (replace the cookiecutter placeholder entirely)
-- Modify: `tests/test_component.py` is untouched by this task; new test file below
 - Test: `tests/test_configuration.py` (new)
 
 **Interfaces:**
 - Produces: `class Environment(str, Enum)` (`us`, `eu`, `uk`, `aus`); `class LoadType(str, Enum)`
-  (`full_load`, `incremental_load`); `class Configuration(BaseModel)` with fields `environment:
-  Environment`, `tenant: str`, `username: str`, `password: SecretStr` (alias `#password`),
-  `tables: list[str]` (min length 1), `page_size: int = 20000`, `load_type: LoadType =
-  LoadType.full_load`; property `incremental: bool` (`load_type == LoadType.incremental_load`).
-  Raises `keboola.component.exceptions.UserException` on any Pydantic `ValidationError`.
+  (`full_load`, `incremental_load`); `class RootConfig(BaseModel)` with fields `environment:
+  Environment`, `tenant: str`, `username: str`, `password: SecretStr` (alias `#password`), `extra=
+  "ignore"`; `class Configuration(RootConfig)` adding `table: str`, `load_type: LoadType =
+  LoadType.full_load`, `page_size: int = 20000`, `extra="forbid"`; property `Configuration.incremental:
+  bool` (`load_type == LoadType.incremental_load`). Both raise `keboola.component.exceptions.
+  UserException` on a Pydantic `ValidationError`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -70,56 +90,70 @@ import unittest
 from keboola.component.exceptions import UserException
 from pydantic import SecretStr
 
-from configuration import Configuration, Environment, LoadType
+from configuration import Configuration, Environment, LoadType, RootConfig
 
-VALID_PARAMS = {
+ROOT_PARAMS = {
     "environment": "us",
     "tenant": "acme",
     "username": "svc@example.com",
     "#password": "secret-value",
-    "tables": ["booking", "resource"],
 }
+ROW_PARAMS = {**ROOT_PARAMS, "table": "booking"}
+
+
+class TestRootConfig(unittest.TestCase):
+    def test_valid_root_config_parses(self):
+        cfg = RootConfig(**ROOT_PARAMS)
+        self.assertEqual(cfg.environment, Environment.us)
+        self.assertIsInstance(cfg.password, SecretStr)
+        self.assertEqual(cfg.password.get_secret_value(), "secret-value")
+
+    def test_tolerates_extra_row_fields_present_in_merged_config(self):
+        # Simulates the platform handing a row-level sync action the merged root+row-draft
+        # parameters, where row fields may be present even though RootConfig doesn't need them.
+        cfg = RootConfig(**{**ROOT_PARAMS, "table": "booking", "load_type": "full_load", "page_size": 20000})
+        self.assertEqual(cfg.tenant, "acme")
+
+    def test_tolerates_missing_table_field_entirely(self):
+        # The exact scenario list_tables hits on a brand-new row: `table` isn't set yet at all.
+        cfg = RootConfig(**ROOT_PARAMS)  # no KeyError / ValidationError despite no `table` key
+        self.assertEqual(cfg.username, "svc@example.com")
+
+    def test_missing_required_root_field_raises_user_exception(self):
+        params = dict(ROOT_PARAMS)
+        del params["tenant"]
+        with self.assertRaises(UserException):
+            RootConfig(**params)
+
+    def test_invalid_environment_raises_user_exception(self):
+        with self.assertRaises(UserException):
+            RootConfig(**{**ROOT_PARAMS, "environment": "ca"})
 
 
 class TestConfiguration(unittest.TestCase):
-    def test_valid_config_parses(self):
-        cfg = Configuration(**VALID_PARAMS)
-        self.assertEqual(cfg.environment, Environment.us)
-        self.assertEqual(cfg.tenant, "acme")
-        self.assertEqual(cfg.username, "svc@example.com")
-        self.assertIsInstance(cfg.password, SecretStr)
-        self.assertEqual(cfg.password.get_secret_value(), "secret-value")
-        self.assertEqual(cfg.tables, ["booking", "resource"])
+    def test_valid_row_config_parses(self):
+        cfg = Configuration(**ROW_PARAMS)
+        self.assertEqual(cfg.table, "booking")
         self.assertEqual(cfg.page_size, 20000)
         self.assertEqual(cfg.load_type, LoadType.full_load)
         self.assertFalse(cfg.incremental)
 
     def test_incremental_load_type(self):
-        cfg = Configuration(**{**VALID_PARAMS, "load_type": "incremental_load"})
+        cfg = Configuration(**{**ROW_PARAMS, "load_type": "incremental_load"})
         self.assertTrue(cfg.incremental)
 
-    def test_missing_required_field_raises_user_exception(self):
-        params = dict(VALID_PARAMS)
-        del params["tenant"]
+    def test_missing_table_raises_user_exception(self):
         with self.assertRaises(UserException):
-            Configuration(**params)
+            Configuration(**ROOT_PARAMS)  # no `table` — this is the strict, run()-time model
 
-    def test_empty_tables_raises_user_exception(self):
+    def test_extra_unknown_field_rejected(self):
         with self.assertRaises(UserException):
-            Configuration(**{**VALID_PARAMS, "tables": []})
-
-    def test_invalid_environment_raises_user_exception(self):
-        with self.assertRaises(UserException):
-            Configuration(**{**VALID_PARAMS, "environment": "ca"})
+            Configuration(**{**ROW_PARAMS, "unexpected_field": "x"})
 
     def test_password_never_appears_in_string_representation(self):
-        cfg = Configuration(**VALID_PARAMS)
+        cfg = Configuration(**ROW_PARAMS)
         self.assertNotIn("secret-value", str(cfg))
         self.assertNotIn("secret-value", repr(cfg))
-
-    def test_extra_field_rejected(self):
-        with self.assertRaises(UserException):
-            Configuration(**{**VALID_PARAMS, "unexpected_field": "x"})
 
 
 if __name__ == "__main__":
@@ -129,13 +163,31 @@ if __name__ == "__main__":
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `uv run pytest tests/test_configuration.py -v`
-Expected: `ModuleNotFoundError` or `ImportError` (`Environment`/`LoadType` don't exist yet in
-`configuration.py`, which still has the cookiecutter placeholder fields).
+Expected: `ImportError`/`ModuleNotFoundError` — `RootConfig`/`Configuration`/`Environment`/`LoadType`
+don't exist yet (`configuration.py` still has the cookiecutter placeholder fields).
 
 - [ ] **Step 3: Replace `src/configuration.py`**
 
 ```python
-"""Pydantic configuration model for keboola.ex-retain-cloud."""
+"""Pydantic configuration models for keboola.ex-retain-cloud.
+
+Two models, matching the root/row `configSchema.json` / `configRowSchema.json` split exactly
+(spec §5/§6):
+
+- `RootConfig` — the four shared connection fields. Deliberately `extra="ignore"`: this model is
+  also used for *partial* instantiation by sync actions that only need the connection fields
+  (`test_connection`, and `list_tables` before a row's `table` is chosen) — it must tolerate
+  whatever row-level keys happen to be present, absent, or blank in the merged parameters handed to
+  a sync action, per the "partial instantiation only required when a sync action needs fewer fields
+  than run()" pattern.
+- `Configuration(RootConfig)` — adds the three row fields. `extra="forbid"`: used only by `run()`,
+  where the platform guarantees the merged config is complete and valid, so unexpected keys should
+  be treated as a real problem, not silently ignored.
+
+`fetch_mode` is deliberately NOT a field on either model — V1 only implements `full_fetch` (spec
+§2), and that fact lives as the `FETCH_MODE_FULL_FETCH` constant in `extractor.py`, not as a
+user-configurable or even internally-modeled value here.
+"""
 
 import logging
 from enum import Enum
@@ -158,60 +210,65 @@ class LoadType(str, Enum):
     incremental_load = "incremental_load"
 
 
-class Configuration(BaseModel):
-    """Validated shape of `config.json`'s `parameters` object.
+def _raise_user_exception(e: ValidationError) -> None:
+    error_messages = [f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in e.errors()]
+    raise UserException(f"Configuration error: {', '.join(error_messages)}") from e
 
-    `fetch_mode` is deliberately NOT a field here: V1 only implements `full_fetch` (spec §2), and
-    that fact lives as the `FETCH_MODE_FULL_FETCH` constant in `extractor.py`, not as a
-    user-configurable or even internally-modeled value on this class.
-    """
 
-    model_config = ConfigDict(extra="forbid")
+class RootConfig(BaseModel):
+    """The shared connection fields — root config, per spec §5."""
+
+    model_config = ConfigDict(extra="ignore")
 
     environment: Environment
     tenant: str
     username: str
     password: SecretStr = Field(alias="#password")
-    tables: list[str] = Field(min_length=1)
-    page_size: int = 20000
-    load_type: LoadType = LoadType.full_load
 
     def __init__(self, **data):
         try:
             super().__init__(**data)
         except ValidationError as e:
-            error_messages = [f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in e.errors()]
-            raise UserException(f"Configuration error: {', '.join(error_messages)}") from e
+            _raise_user_exception(e)
+
+
+class Configuration(RootConfig):
+    """The fully merged root+row config used by `run()` — per spec §5."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    table: str
+    load_type: LoadType = LoadType.full_load
+    page_size: int = 20000
 
     @property
     def incremental(self) -> bool:
-        """True when the user selected Incremental Load (spec §2) — per-table PK-safety fallback
-        is applied later in `component.py`, not here."""
+        """True when this row selected Incremental Load — the per-run PK-safety fallback (spec
+        §2/§6) is applied later in `component.py`, not here."""
         return self.load_type == LoadType.incremental_load
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_configuration.py -v`
-Expected: PASS (7 tests).
+Expected: PASS (11 tests).
 
 - [ ] **Step 5: Lint and type-check**
 
 Run: `uv run ruff check src/ tests/ && uv run ruff format --check src/ tests/ && uv run ty check`
-Expected: clean (fix any `ty` complaint about the `__init__` override signature before moving on —
-`BaseModel.__init__` typing may need `# type: ignore[no-untyped-def]` only if `ty` genuinely flags
-it; do not silence unrelated warnings).
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add src/configuration.py tests/test_configuration.py
-git commit -m "feat: add Retain Cloud configuration model"
+git commit -m "feat: add root/row configuration models for Retain Cloud"
 ```
 
 ---
 
 ### Task 2: `RetainCloudClient` — host map, JWT lifecycle, discovery, and the raw paging call
+
+Unaffected by the config-shape revision — this task is identical to the prior plan version.
 
 **Files:**
 - Create: `src/client.py`
@@ -532,7 +589,8 @@ git commit -m "feat: add RetainCloudClient with JWT lifecycle and discovery call
 
 ### Task 3: Table schema construction + streaming fetch (`extractor.py`)
 
-This is the core algorithm from spec §6: the two-call `paging/paged` contract, `/tmp` staging, PK
+Unaffected by the config-shape revision — this task is identical to the prior plan version. It is
+the core algorithm from spec §6: the two-call `paging/paged` contract, `/tmp` staging, PK
 uniqueness, and per-column native-type verification. It consumes `RetainCloudClient.fetch_table_page`
 (Task 2) and `RetainCloudClient.get_table_schema` (Task 2), and is consumed by `component.py`
 (Task 5).
@@ -751,6 +809,10 @@ Implements the resolved `paging/paged` contract (spec §6): `pageSize` is a sing
 a page window. Every response streams into a `/tmp` scratch file — never directly into
 `/data/out/tables/` — so a failed second call never leaves a partial/truncated file for Storage to
 upload (see the spec's "Corrected staging rule").
+
+`FETCH_MODE_FULL_FETCH` is the one internal-only constant referenced by `component.py` — spec §2's
+sanctioned Fetch-Mode omission. It is not a Pydantic field on any model (unlike `load_type`, which
+is a real row-level field — see `configuration.py`).
 """
 
 import csv
@@ -765,6 +827,8 @@ import requests
 from keboola.component.dao import SupportedDataTypes
 
 logger = logging.getLogger(__name__)
+
+FETCH_MODE_FULL_FETCH = "full_fetch"
 
 _DATETIME_TYPE = "DateTime"
 _VERIFY_TYPES = {"Bool", "Int", "Float"}  # verified against real streamed rows before going native
@@ -888,7 +952,7 @@ def _iter_envelope(response: requests.Response):
                     builder = None
 
 
-def _stream_to_csv(response: requests.Response, schema: TableSchema_, csv_path: Path) -> FetchResult:
+def _stream_to_csv(response: requests.Response, schema: TableSchema_, csv_path: Path) -> tuple[FetchResult, int]:
     fieldnames = [c.name for c in schema.columns]
     declared_by_name = {c.name: c.declared_type for c in schema.columns}
     verified = {c.name: True for c in schema.columns if c.declared_type in _VERIFY_TYPES}
@@ -925,8 +989,8 @@ def fetch_table(client, table: str, schema: TableSchema_, page_size: int, scratc
     """Fetch a table to completion into a `/tmp` scratch file (spec §6 algorithm).
 
     Raises `requests.HTTPError` on any HTTP failure and `ijson.JSONError` on a malformed response —
-    both propagate to the caller (`component.py`), which is responsible for the per-table
-    try/except that turns this into a logged warning rather than aborting the whole run.
+    both propagate to the caller (`component.py`), which turns this into a `UserException` for this
+    row's job rather than a per-table "log and continue" (there is no other table in this row).
     """
     scratch_dir.mkdir(parents=True, exist_ok=True)
     csv_path = scratch_dir / f"{table}.csv"
@@ -980,17 +1044,20 @@ git commit -m "feat: add streaming per-table fetch with native-type verification
 
 ---
 
-### Task 4: Sync actions — `test_connection` and `list_tables`
+### Task 4: Sync actions — root-level `test_connection` and row-level `list_tables`
 
 **Files:**
 - Modify: `src/component.py` (add sync-action methods; full `run()` rewrite is Task 5)
 - Test: `tests/test_sync_actions.py`
 
 **Interfaces:**
-- Consumes: `Configuration` (Task 1), `RetainCloudClient` (Task 2).
+- Consumes: `RootConfig` (Task 1), `RetainCloudClient` (Task 2).
 - Produces: `Component.test_connection(self) -> None` (raises `UserException` on failure, per the
   `keboola.component` sync-action convention — the framework serializes success/exception into the
-  sync-action response; there is nothing further for this method to return), `Component.list_tables(self) -> list[dict]` returning `[{"value": <raw table name>, "label": <alias or raw name>}, ...]`.
+  sync-action response), `Component.list_tables(self) -> list[dict]` returning `[{"value": <raw
+  table name>, "label": <alias or raw name>}, ...]`. Both parse `RootConfig`, **not**
+  `Configuration` — this is the load-bearing fix from spec §6: `list_tables` must work even when the
+  row's `table` field isn't set yet.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1003,54 +1070,64 @@ from keboola.component.exceptions import UserException
 
 from component import Component
 
-
-def _configured_component(monkeypatch_params):
-    comp = Component()
-    comp.configuration.parameters = monkeypatch_params
-    return comp
-
-
-VALID_PARAMS = {
+ROOT_PARAMS = {
     "environment": "us",
     "tenant": "acme",
     "username": "svc@example.com",
     "#password": "pw",
-    "tables": ["booking"],
 }
+
+
+def _component(params):
+    comp = Component()
+    comp.configuration.parameters = params
+    return comp
 
 
 class TestTestConnection(unittest.TestCase):
     @mock.patch("component.RetainCloudClient")
     def test_success_does_not_raise(self, mock_client_cls):
         mock_client_cls.return_value.authenticate.return_value = None
-        comp = _configured_component(VALID_PARAMS)
+        comp = _component(ROOT_PARAMS)
         comp.test_connection()  # must not raise
 
     @mock.patch("component.RetainCloudClient")
     def test_auth_failure_raises_user_exception(self, mock_client_cls):
         mock_client_cls.return_value.authenticate.side_effect = UserException("bad creds")
-        comp = _configured_component(VALID_PARAMS)
+        comp = _component(ROOT_PARAMS)
         with self.assertRaises(UserException):
             comp.test_connection()
 
 
 class TestListTablesSyncAction(unittest.TestCase):
     @mock.patch("component.RetainCloudClient")
-    def test_merges_labels_with_table_names(self, mock_client_cls):
+    def test_works_before_table_field_is_set(self, mock_client_cls):
+        # The exact scenario a brand-new row hits: `table` isn't in the merged params at all yet.
         client = mock_client_cls.return_value
         client.list_tables.return_value = ["booking", "resource"]
         client.list_table_labels.return_value = [{"name": "booking", "alias": "Bookings"}]
-        comp = _configured_component(VALID_PARAMS)
+        comp = _component(ROOT_PARAMS)  # no "table" key present
 
-        options = comp.list_tables()
+        options = comp.list_tables()  # must not raise a validation error
 
         self.assertIn({"value": "booking", "label": "Bookings"}, options)
         self.assertIn({"value": "resource", "label": "resource"}, options)  # no alias -> raw name
 
     @mock.patch("component.RetainCloudClient")
+    def test_tolerates_partially_filled_row_fields(self, mock_client_cls):
+        client = mock_client_cls.return_value
+        client.list_tables.return_value = ["booking"]
+        client.list_table_labels.return_value = []
+        comp = _component({**ROOT_PARAMS, "table": "", "load_type": "full_load"})
+
+        options = comp.list_tables()
+
+        self.assertEqual(options, [{"value": "booking", "label": "booking"}])
+
+    @mock.patch("component.RetainCloudClient")
     def test_auth_failure_raises_user_exception(self, mock_client_cls):
         mock_client_cls.return_value.authenticate.side_effect = UserException("bad creds")
-        comp = _configured_component(VALID_PARAMS)
+        comp = _component(ROOT_PARAMS)
         with self.assertRaises(UserException):
             comp.list_tables()
 
@@ -1076,15 +1153,14 @@ from keboola.component.base import ComponentBase, sync_action
 from keboola.component.exceptions import UserException
 
 from client import RetainCloudClient
-from configuration import Configuration
+from configuration import RootConfig
 
 
 class Component(ComponentBase):
     def __init__(self):
         super().__init__()
 
-    def _build_client(self) -> RetainCloudClient:
-        cfg = Configuration(**self.configuration.parameters)
+    def _build_authenticated_client(self, cfg: RootConfig) -> RetainCloudClient:
         client = RetainCloudClient(
             environment=cfg.environment.value,
             tenant=cfg.tenant,
@@ -1096,11 +1172,16 @@ class Component(ComponentBase):
 
     @sync_action("testConnection")
     def test_connection(self) -> None:
-        self._build_client()
+        cfg = RootConfig(**self.configuration.parameters)
+        self._build_authenticated_client(cfg)
 
     @sync_action("list_tables")
     def list_tables(self) -> list[dict]:
-        client = self._build_client()
+        # Deliberately RootConfig, not Configuration — a fresh row may not have `table` set yet
+        # (spec §6's "partial instantiation" fix). Any row-level keys present in the merged
+        # parameters (table/load_type/page_size) are simply ignored by RootConfig's extra="ignore".
+        cfg = RootConfig(**self.configuration.parameters)
+        client = self._build_authenticated_client(cfg)
         table_names = client.list_tables()
         labels_by_name = {row["name"]: row.get("alias") for row in client.list_table_labels()}
         return [{"value": name, "label": labels_by_name.get(name) or name} for name in table_names]
@@ -1130,12 +1211,18 @@ git commit -m "feat: add test_connection and list_tables sync actions"
 
 ---
 
-### Task 5: `run()` orchestration — the full per-table loop
+### Task 5: `run()` orchestration — one row, one table, no loop
+
+Significantly simpler than the prior single-config plan version: there is exactly one table to
+handle per execution, so there is no per-table loop, no `failed_tables` bookkeeping, and no
+"some/all tables failed" branching — a table failure now raises `UserException` directly, and the
+platform's per-row isolation does the rest.
 
 **Files:**
 - Modify: `src/component.py` (replace the placeholder `run()` entirely; keep the sync actions from
   Task 4)
-- Modify: `data/config.json` (local dev fixture — replace the cookiecutter placeholder parameters)
+- Modify: `data/config.json` (local dev fixture — replace the cookiecutter placeholder parameters
+  with a single merged root+row config, since that's the shape the component actually receives)
 - Test: `tests/test_run.py`
 
 **Interfaces:**
@@ -1154,19 +1241,19 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import requests
+from keboola.component.dao import SupportedDataTypes
 from keboola.component.exceptions import UserException
 
 from component import Component
 from extractor import ColumnSchema, FetchResult, TableSchema_
-from keboola.component.dao import SupportedDataTypes
 
-
-VALID_PARAMS = {
+ROW_PARAMS = {
     "environment": "us",
     "tenant": "acme",
     "username": "svc@example.com",
     "#password": "pw",
-    "tables": ["booking", "resource"],
+    "table": "booking",
 }
 
 
@@ -1193,104 +1280,101 @@ class TestRunOrchestration(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.data_dir, ignore_errors=True)
 
-    def _component(self):
+    def _component(self, params=None):
         comp = Component()
-        comp.configuration.parameters = dict(VALID_PARAMS)
+        comp.configuration.parameters = dict(params or ROW_PARAMS)
         return comp
 
     @mock.patch("component.fetch_table")
     @mock.patch("component.build_table_schema")
     @mock.patch("component.RetainCloudClient")
-    def test_all_tables_succeed(self, mock_client_cls, mock_build_schema, mock_fetch_table):
+    def test_table_succeeds(self, mock_client_cls, mock_build_schema, mock_fetch_table):
         client = mock_client_cls.return_value
         client.list_tables.return_value = ["booking", "resource"]
-        mock_build_schema.side_effect = lambda table, _fields: _schema(table)
+        mock_build_schema.return_value = _schema("booking")
         mock_fetch_table.side_effect = lambda _client, table, _schema, _page_size, scratch_dir: _fetch_result(scratch_dir, table)
 
         comp = self._component()
         with mock.patch.object(type(comp), "_data_dir", new_callable=mock.PropertyMock, return_value=str(self.data_dir)):
-            comp.run()
+            comp.run()  # must not raise
 
         self.assertTrue((self.data_dir / "out" / "tables" / "booking.csv").exists())
-        self.assertTrue((self.data_dir / "out" / "tables" / "resource.csv").exists())
 
     @mock.patch("component.fetch_table")
     @mock.patch("component.build_table_schema")
     @mock.patch("component.RetainCloudClient")
-    def test_one_table_fails_others_still_succeed(self, mock_client_cls, mock_build_schema, mock_fetch_table):
-        import requests
-
+    def test_table_fetch_failure_raises_user_exception(self, mock_client_cls, mock_build_schema, mock_fetch_table):
         client = mock_client_cls.return_value
-        client.list_tables.return_value = ["booking", "resource"]
-        mock_build_schema.side_effect = lambda table, _fields: _schema(table)
-
-        def fetch_side_effect(_client, table, _schema, _page_size, scratch_dir):
-            if table == "booking":
-                raise requests.HTTPError(response=mock.Mock(status_code=403))
-            return _fetch_result(scratch_dir, table)
-
-        mock_fetch_table.side_effect = fetch_side_effect
-
-        comp = self._component()
-        with mock.patch.object(type(comp), "_data_dir", new_callable=mock.PropertyMock, return_value=str(self.data_dir)):
-            comp.run()  # must NOT raise — one table failing doesn't fail the run
-
-        self.assertFalse((self.data_dir / "out" / "tables" / "booking.csv").exists())
-        self.assertTrue((self.data_dir / "out" / "tables" / "resource.csv").exists())
-
-    @mock.patch("component.fetch_table")
-    @mock.patch("component.build_table_schema")
-    @mock.patch("component.RetainCloudClient")
-    def test_all_tables_fail_raises_user_exception(self, mock_client_cls, mock_build_schema, mock_fetch_table):
-        import requests
-
-        client = mock_client_cls.return_value
-        client.list_tables.return_value = ["booking", "resource"]
-        mock_build_schema.side_effect = lambda table, _fields: _schema(table)
-        mock_fetch_table.side_effect = requests.HTTPError(response=mock.Mock(status_code=404))
+        client.list_tables.return_value = ["booking"]
+        mock_build_schema.return_value = _schema("booking")
+        mock_fetch_table.side_effect = requests.HTTPError(response=mock.Mock(status_code=403))
 
         comp = self._component()
         with mock.patch.object(type(comp), "_data_dir", new_callable=mock.PropertyMock, return_value=str(self.data_dir)):
             with self.assertRaises(UserException):
                 comp.run()
 
+        self.assertFalse((self.data_dir / "out" / "tables" / "booking.csv").exists())
+
     @mock.patch("component.fetch_table")
     @mock.patch("component.build_table_schema")
     @mock.patch("component.RetainCloudClient")
-    def test_selected_table_missing_from_structure_is_a_per_table_failure(self, mock_client_cls, mock_build_schema, mock_fetch_table):
+    def test_table_missing_from_structure_raises_user_exception(self, mock_client_cls, mock_build_schema, mock_fetch_table):
         client = mock_client_cls.return_value
         client.list_tables.return_value = ["resource"]  # "booking" was selected but no longer exists
-        mock_build_schema.side_effect = lambda table, _fields: _schema(table)
-        mock_fetch_table.side_effect = lambda _client, table, _schema, _page_size, scratch_dir: _fetch_result(scratch_dir, table)
 
         comp = self._component()
         with mock.patch.object(type(comp), "_data_dir", new_callable=mock.PropertyMock, return_value=str(self.data_dir)):
-            comp.run()  # must not raise: one of two tables still succeeded
+            with self.assertRaises(UserException):
+                comp.run()
 
-        self.assertFalse((self.data_dir / "out" / "tables" / "booking.csv").exists())
-        self.assertTrue((self.data_dir / "out" / "tables" / "resource.csv").exists())
+        mock_build_schema.assert_not_called()
+        mock_fetch_table.assert_not_called()
 
     @mock.patch("component.fetch_table")
     @mock.patch("component.build_table_schema")
     @mock.patch("component.RetainCloudClient")
-    def test_incremental_load_falls_back_per_table_on_unverified_pk(self, mock_client_cls, mock_build_schema, mock_fetch_table):
+    def test_incremental_load_falls_back_when_pk_not_verified(self, mock_client_cls, mock_build_schema, mock_fetch_table):
         client = mock_client_cls.return_value
-        client.list_tables.return_value = ["booking", "resource"]
-        mock_build_schema.side_effect = lambda table, _fields: _schema(table)
+        client.list_tables.return_value = ["booking"]
+        mock_build_schema.return_value = _schema("booking")
+        mock_fetch_table.side_effect = lambda _client, table, _schema, _page_size, scratch_dir: _fetch_result(
+            scratch_dir, table, pk_unique=False
+        )
 
-        def fetch_side_effect(_client, table, _schema, _page_size, scratch_dir):
-            pk_unique = table == "booking"  # resource's PK did not verify unique this run
-            return _fetch_result(scratch_dir, table, pk_unique=pk_unique)
-
-        mock_fetch_table.side_effect = fetch_side_effect
-
-        comp = self._component()
-        comp.configuration.parameters = {**VALID_PARAMS, "load_type": "incremental_load"}
+        comp = self._component({**ROW_PARAMS, "load_type": "incremental_load"})
         captured = {}
         original = comp.create_out_table_definition_from_schema
 
         def capture(table_schema, **kwargs):
-            captured[table_schema.name] = kwargs.get("incremental")
+            captured["incremental"] = kwargs.get("incremental")
+            return original(table_schema, **kwargs)
+
+        with (
+            mock.patch.object(type(comp), "_data_dir", new_callable=mock.PropertyMock, return_value=str(self.data_dir)),
+            mock.patch.object(comp, "create_out_table_definition_from_schema", side_effect=capture),
+        ):
+            comp.run()  # must NOT raise — this is a fallback, not a failure
+
+        self.assertFalse(captured["incremental"])  # fell back to full load for this run
+
+    @mock.patch("component.fetch_table")
+    @mock.patch("component.build_table_schema")
+    @mock.patch("component.RetainCloudClient")
+    def test_incremental_load_applied_when_pk_verifies(self, mock_client_cls, mock_build_schema, mock_fetch_table):
+        client = mock_client_cls.return_value
+        client.list_tables.return_value = ["booking"]
+        mock_build_schema.return_value = _schema("booking")
+        mock_fetch_table.side_effect = lambda _client, table, _schema, _page_size, scratch_dir: _fetch_result(
+            scratch_dir, table, pk_unique=True
+        )
+
+        comp = self._component({**ROW_PARAMS, "load_type": "incremental_load"})
+        captured = {}
+        original = comp.create_out_table_definition_from_schema
+
+        def capture(table_schema, **kwargs):
+            captured["incremental"] = kwargs.get("incremental")
             return original(table_schema, **kwargs)
 
         with (
@@ -1299,8 +1383,7 @@ class TestRunOrchestration(unittest.TestCase):
         ):
             comp.run()
 
-        self.assertTrue(captured["booking"])
-        self.assertFalse(captured["resource"])  # fell back to full load for this table only
+        self.assertTrue(captured["incremental"])
 
 
 if __name__ == "__main__":
@@ -1327,13 +1410,14 @@ import shutil
 import sys
 from pathlib import Path
 
+import requests
 from keboola.component.base import ComponentBase, sync_action
 from keboola.component.exceptions import UserException
 from keboola.component.table_schema import FieldSchema, TableSchema
 
 from client import RetainCloudClient
-from configuration import Configuration
-from extractor import FetchResult, TableSchema_, build_table_schema, fetch_table
+from configuration import Configuration, RootConfig
+from extractor import TableSchema_, build_table_schema, fetch_table
 
 logger = logging.getLogger(__name__)
 
@@ -1347,26 +1431,17 @@ class Component(ComponentBase):
     def run(self) -> None:
         cfg = Configuration(**self.configuration.parameters)
         client = self._build_authenticated_client(cfg)
-        live_tables = set(client.list_tables())
 
-        failed_tables: list[str] = []
-        for table in cfg.tables:
-            if table not in live_tables:
-                logger.warning("Table %s was selected but is no longer present in structure — skipping.", table)
-                failed_tables.append(table)
-                continue
-            try:
-                self._process_table(client, cfg, table)
-            except Exception:
-                logger.exception("Table %s failed — continuing with the remaining selected tables.", table)
-                failed_tables.append(table)
+        if cfg.table not in set(client.list_tables()):
+            raise UserException(f"Table '{cfg.table}' is no longer present in this tenant's structure.")
 
-        if failed_tables and len(failed_tables) < len(cfg.tables):
-            logger.warning("The following tables failed and produced no output this run: %s", failed_tables)
-        elif failed_tables:
-            raise UserException(f"Every selected table failed: {failed_tables}")
+        try:
+            self._process_table(client, cfg)
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "unknown"
+            raise UserException(f"Failed to fetch table '{cfg.table}' (HTTP {status}).") from e
 
-    def _build_authenticated_client(self, cfg: Configuration) -> RetainCloudClient:
+    def _build_authenticated_client(self, cfg: RootConfig) -> RetainCloudClient:
         client = RetainCloudClient(
             environment=cfg.environment.value,
             tenant=cfg.tenant,
@@ -1376,20 +1451,20 @@ class Component(ComponentBase):
         client.authenticate()
         return client
 
-    def _process_table(self, client: RetainCloudClient, cfg: Configuration, table: str) -> None:
-        rich_fields = client.get_table_schema(table)
-        schema = build_table_schema(table, rich_fields)
-        result = fetch_table(client, table, schema, cfg.page_size, _SCRATCH_DIR)
+    def _process_table(self, client: RetainCloudClient, cfg: Configuration) -> None:
+        rich_fields = client.get_table_schema(cfg.table)
+        schema = build_table_schema(cfg.table, rich_fields)
+        result = fetch_table(client, cfg.table, schema, cfg.page_size, _SCRATCH_DIR)
 
         incremental_for_table = cfg.incremental and result.pk_unique
         if cfg.incremental and not result.pk_unique:
             logger.warning(
                 "Table %s: Incremental Load was requested but the primary key did not verify "
-                "unique this run — falling back to full load for this table only.", table,
+                "unique this run — falling back to full load for this run.", cfg.table,
             )
 
         table_def = self.create_out_table_definition_from_schema(
-            self._to_output_schema(schema, incremental_for_table),
+            self._to_output_schema(schema),
             incremental=incremental_for_table,
         )
         Path(table_def.full_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1397,21 +1472,21 @@ class Component(ComponentBase):
         self.write_manifest(table_def)
 
     @staticmethod
-    def _to_output_schema(schema: TableSchema_, incremental: bool) -> TableSchema:
-        primary_keys = [schema.pk_column] if (schema.pk_column and incremental) else (
-            [schema.pk_column] if schema.pk_column else None
-        )
+    def _to_output_schema(schema: TableSchema_) -> TableSchema:
+        # The PK is declared whenever the column exists, regardless of incremental/full load —
+        # Storage can still dedupe on it within a single load either way (output-mapping.md).
+        primary_keys = [schema.pk_column] if schema.pk_column else None
         fields = [FieldSchema(name=c.name, base_type=c.base_type, nullable=True) for c in schema.columns]
         return TableSchema(name=schema.table, fields=fields, primary_keys=primary_keys)
 
     @sync_action("testConnection")
     def test_connection(self) -> None:
-        cfg = Configuration(**self.configuration.parameters)
+        cfg = RootConfig(**self.configuration.parameters)
         self._build_authenticated_client(cfg)
 
     @sync_action("list_tables")
     def list_tables(self) -> list[dict]:
-        cfg = Configuration(**self.configuration.parameters)
+        cfg = RootConfig(**self.configuration.parameters)
         client = self._build_authenticated_client(cfg)
         table_names = client.list_tables()
         labels_by_name = {row["name"]: row.get("alias") for row in client.list_table_labels()}
@@ -1430,17 +1505,9 @@ if __name__ == "__main__":
         sys.exit(2)
 ```
 
-**Note on primary key + incremental:** the PK is kept on the manifest whenever `schema.pk_column`
-exists, regardless of `incremental_for_table` — a Full Load table can still declare a PK (it's
-informational and lets Storage dedupe within a single load per `output-mapping.md`); what actually
-changes with `incremental_for_table` is only the `incremental=` flag itself. Simplify
-`_to_output_schema`'s `primary_keys` line accordingly if review flags the redundant conditional — it
-was written defensively during planning; collapse to `[schema.pk_column] if schema.pk_column else
-None` once confirmed correct against `output-mapping.md`'s stated behaviour ("`incremental: false`
-... `+ primary key` still declares the key for informational/dedup purposes").
-
-- [ ] **Step 4: Update `data/config.json`** (local dev fixture, cookiecutter placeholder still has
-  `print_hello`/`#api_token`):
+- [ ] **Step 4: Update `data/config.json`** (local dev fixture — a single, fully merged root+row
+  config, since that's the exact shape the component receives per `config-rows.md`; the
+  cookiecutter placeholder still has `print_hello`/`#api_token`):
 
 ```json
 {
@@ -1453,7 +1520,7 @@ None` once confirmed correct against `output-mapping.md`'s stated behaviour ("`i
     "tenant": "acme",
     "username": "svc@example.com",
     "#password": "replace-with-a-real-test-password-locally-never-commit-one",
-    "tables": ["booking"],
+    "table": "booking",
     "page_size": 20000,
     "load_type": "full_load"
   }
@@ -1482,7 +1549,7 @@ Run: `uv run ruff check src/ tests/ && uv run ruff format --check src/ tests/ &&
 
 ```bash
 git add src/component.py data/config.json
-git commit -m "feat: wire run() orchestration with per-table failure isolation"
+git commit -m "feat: wire single-table run() orchestration for config-row execution"
 ```
 
 ---
@@ -1491,7 +1558,8 @@ git commit -m "feat: wire run() orchestration with per-table failure isolation"
 
 A dedicated, explicit test for spec §3's "never log the token or password" requirement — the named,
 confirmed incident risk. This deserves its own small task rather than being folded into Task 2/5,
-since it's a cross-cutting property review will specifically look for, not a feature.
+since it's a cross-cutting property review will specifically look for, not a feature. Unaffected by
+the config-shape revision.
 
 **Files:**
 - Test: `tests/test_no_secret_leakage.py`
@@ -1505,11 +1573,9 @@ since it's a cross-cutting property review will specifically look for, not a fea
 ```python
 # tests/test_no_secret_leakage.py
 import logging
-import time
 import unittest
 from unittest import mock
 
-from client import RetainCloudClient
 from configuration import Configuration
 
 SECRET_PASSWORD = "super-secret-value-should-never-appear-in-logs"
@@ -1525,6 +1591,8 @@ class TestNoSecretLeakage(unittest.TestCase):
 
     def test_authenticate_failure_does_not_log_password(self):
         import requests
+
+        from client import RetainCloudClient
 
         client = RetainCloudClient("us", "acme", "user@example.com", SECRET_PASSWORD)
         with mock.patch.object(RetainCloudClient, "post_raw") as mock_post_raw:
@@ -1542,7 +1610,7 @@ class TestNoSecretLeakage(unittest.TestCase):
     def test_config_str_and_repr_never_contain_password(self):
         cfg = Configuration(
             environment="us", tenant="acme", username="user@example.com",
-            **{"#password": SECRET_PASSWORD}, tables=["booking"],
+            **{"#password": SECRET_PASSWORD}, table="booking",
         )
         self.assertNotIn(SECRET_PASSWORD, str(cfg))
         self.assertNotIn(SECRET_PASSWORD, repr(cfg))
@@ -1575,46 +1643,56 @@ git commit -m "test: add regression coverage for secret-leakage into logs"
 ### Task 7: Config schema / UI (delegated to `component-developer:ui-developer`)
 
 **Owner: `component-developer:ui-developer`** (or the `component-build-ui` skill it wraps) — this
-plan does not author `configSchema.json` itself, per the hard boundary between component code and
-schema/UI work. This task's "step" is the brief to hand that skill, not JSON to write directly.
+plan does not author `configSchema.json`/`configRowSchema.json` itself, per the hard boundary
+between component code and schema/UI work. This task's "step" is the brief to hand that skill, not
+JSON to write directly. **Both files are now populated** — unlike the prior plan version,
+`configRowSchema.json` is no longer `{}`, since this component uses config rows.
 
 **Files:**
-- Modify: `component_config/configSchema.json` (replace the `print_hello`/`debug` placeholder
+- Modify: `component_config/configSchema.json` (root config — replace the `print_hello`/`debug`
+  placeholder entirely)
+- Modify: `component_config/configRowSchema.json` (row config — replace the empty `{}` placeholder
   entirely)
-- `component_config/configRowSchema.json` stays `{}` — this component does not use config rows
-  (spec §5).
 
 - [ ] **Step 1: Dispatch to `component-developer:ui-developer`** with this exact brief (copied from
-  spec §5 "Fields" / "UI scope & config shape" / "UI presentation" tables — the field-by-field
-  decisions are already made; this is implementation, not re-derivation):
+  spec §5's "Root config fields" / "Row config fields" / "UI scope & config shape" / "UI
+  presentation" tables — the field-by-field decisions are already made; this is implementation, not
+  re-derivation):
 
+  **Root config (`configSchema.json`):**
   - `environment`: required, `enum` (`us`/`eu`/`uk`/`aus`) + `enum_titles` (`US`/`EU`/`UK`/`Australia`), no default.
   - `tenant`: required, plain text, no default.
   - `username`: required, plain text, no default.
   - `#password`: required, password widget, no default.
-  - `tables`: required (min 1), creatable-off multi-select, async `select` backed by the
-    `list_tables` sync action, `autoload: ["environment", "tenant", "username", "#password"]`.
+  - Add a `format: "test-connection"` widget on this group (auto-invokes the `testConnection` sync
+    action).
+
+  **Row config (`configRowSchema.json`):**
+  - `table`: required, **single**-select (not multi-select), async `select` backed by the
+    `list_tables` sync action, `autoload: ["environment", "tenant", "username", "#password"]` (the
+    root fields — `table` autoloads once the shared connection is present, even though the sync
+    action is itself row-level).
   - `load_type`: optional, `enum` (`full_load`/`incremental_load`) + `enum_titles` (`Full Load`/
     `Incremental Load`), default `full_load`, **no `options.dependencies` gate** — always visible.
-    Description notes the per-table PK-safety fallback (spec §2/§6) in `options.tooltip`.
+    Description notes the per-run PK-safety fallback (spec §2/§6) in `options.tooltip`.
   - `page_size`: optional, number, default `20000`, nested under an "Advanced options" `type:
     object` section; description + tooltip explain it as a fetch-sizing cap, not a page count (spec
     §6 algorithm).
-  - Add a `format: "test-connection"` widget (auto-invokes the `testConnection` sync action) on the
-    connection fields group.
-  - `fetch_mode` has **no schema field at all** — it is internal-only (spec §5).
+  - `fetch_mode` has **no schema field at all**, on either schema — it is internal-only (spec §5).
 
-- [ ] **Step 2: Verify** — once `ui-developer` completes this, confirm
-  `component_config/configSchema.json` has no leftover `print_hello`/`debug` properties, every
-  `enum` has a matching `enum_titles`, and `tables`' `autoload` list matches the four connection
-  field keys exactly (a typo here silently breaks autoload, per
-  `component-checklist-review/checklists/ui-schema.md`).
+- [ ] **Step 2: Verify** — once `ui-developer` completes this, confirm neither
+  `component_config/configSchema.json` nor `component_config/configRowSchema.json` has leftover
+  cookiecutter placeholder content, every `enum` has a matching `enum_titles`, `table`'s `autoload`
+  list matches the four root connection field keys exactly (a typo here silently breaks autoload,
+  per `component-checklist-review/checklists/ui-schema.md`), and `table` is genuinely a
+  single-select (a multi-select here would silently reintroduce the superseded single-config
+  design at the UI layer even though the Python model expects one string).
 
-- [ ] **Step 3: Commit** (commit message reflects the actual schema authored, e.g.):
+- [ ] **Step 3: Commit** (commit message reflects the actual schemas authored, e.g.):
 
 ```bash
-git add component_config/configSchema.json
-git commit -m "feat: add configSchema for Retain Cloud connection, tables, and load type"
+git add component_config/configSchema.json component_config/configRowSchema.json
+git commit -m "feat: add root configSchema and row configRowSchema for Retain Cloud"
 ```
 
 ---
@@ -1628,21 +1706,30 @@ does not author `tests/functional/` fixtures or cassettes itself.
 - Create: `tests/functional/*/configs.json`, `tests/functional/*/expected/**`, VCR cassettes (owned
   entirely by the tester skill's tooling).
 - `secrets.json` already exists at the repo root with `username`, `#password`, `tenant` keys
-  matching this component's config shape — the tester skill should add `environment`, `tables`, and
-  `page_size` to the corresponding test `config.json` fixtures (these three are not secrets and
-  don't belong in `secrets.json`).
+  matching this component's root config shape — the tester skill should add `environment` (root)
+  and `table`/`page_size`/`load_type` (row) to the corresponding test `config.json` fixtures as a
+  single flat merged parameters object (per `config-rows.md` — the component never sees a root/row
+  split, so a test fixture is just one flat `parameters` dict with every field present, same as any
+  other config's fixture).
 
-- [ ] **Step 1: Dispatch to `component-developer:tester`** with the full case list from spec §7 (18
-  cases: `01_testConnection_success` through `18_run_secondCallFails_noPartialOutput`) as the
-  required coverage. Two cases need special fixture care, called out explicitly so they aren't
-  built as generic VCR replays:
-  - `06_run_twoCall_fullLoad` / `07_run_multiTable_mixedSizes`: the fixture table's declared
-    `rowCount` in the cassette must be deliberately larger than a small test `page_size` (e.g.
-    `rowCount: 5`, `page_size: 2`) — do not use a real 100k-row cassette; the goal is to exercise
-    the two-call branch cheaply, not to load-test.
-  - `18_run_secondCallFails_noPartialOutput`: assert on the **absence** of an output file for that
-    table (not a truncated one) — this is the direct regression test for the grounding-reconciliation
-    finding fixed in Task 3/5 (the `/tmp` staging rule).
+- [ ] **Step 1: Dispatch to `component-developer:tester`** with the full case list from spec §7 (16
+  cases: `01_testConnection_success` through `16_run_secondCallFails_userException_noPartialOutput`)
+  as the required coverage. Flag these explicitly, since they differ from a naive port of the prior
+  (single-config) test list:
+  - Cases `09_run_tableFails_userException`, `14_run_selectedTableGoneFromStructure`, and
+    `16_run_secondCallFails_userException_noPartialOutput` must assert `UserException`/exit 1 — an
+    earlier version of this plan (pre-revision) had these as "warn and continue, exit 0" cases; that
+    is no longer correct now that one row = one table.
+  - `06_run_twoCall_fullLoad`: the fixture table's declared `rowCount` in the cassette must be
+    deliberately larger than a small test `page_size` (e.g. `rowCount: 5`, `page_size: 2`) — do not
+    use a real 100k-row cassette; the goal is to exercise the two-call branch cheaply, not to
+    load-test.
+  - **There is deliberately no "two tables in one run" test case** (spec §7) — the component cannot
+    tell it's part of a multi-row config; that proof belongs to the Phase 7 cf-dev smoke test (§8),
+    which creates two real rows and confirms two independent job outputs.
+  - `03_listTables_success`: must specifically exercise `list_tables` **before** `table` is set on
+    the row (the `RootConfig` partial-instantiation fix, Task 4) — a fixture with `table` already
+    filled in would not catch a regression here.
 - [ ] **Step 2: Verify** the VCR sanitizer wiring redacts `Authorization` and any literal
   username/password values in every recorded cassette interaction (spec §7) — hand off to
   `component-developer:vcr-cassette-validator` per that skill's normal usage before committing
@@ -1653,15 +1740,16 @@ does not author `tests/functional/` fixtures or cassettes itself.
 
 ## Self-Review
 
-**Spec coverage:** §2 (Keboola mapping, extraction modes, config shape) → Tasks 1, 5, 7. §3 (auth) →
-Task 2. §4 (capability scope) → reflected in which client methods exist (Task 2) and which don't
-(no `filter`/`filter/minimised`/write endpoints/plain `tableaccess` GET anywhere in this plan). §5
-(config/schema) → Tasks 1, 7. §6 (architecture, algorithm, typing, error handling, the corrected
-staging rule) → Tasks 2, 3, 5, 6. §7 (testing) → Task 8 (delegated) plus Tasks 1–6's own unit tests.
-§8 (deployment) → out of this plan's scope, owned by the tracker's Phase 7. §9 (risks) → risk #6/#7
-(Load Type granularity, config-shape trade-off) are design decisions already baked into Task 5's
-code, not further action items; risk #8 (`dataTypeSupport` Dev Portal flip) is Phase 6's job, noted
-here so it isn't lost.
+**Spec coverage:** §2 (Keboola mapping, config-rows convention, extraction modes) → Tasks 1, 5, 7.
+§3 (auth) → Task 2. §4 (capability scope) → reflected in which client methods exist (Task 2) and
+which don't (no `filter`/`filter/minimised`/write endpoints/plain `tableaccess` GET anywhere in this
+plan). §5 (root/row config split) → Tasks 1, 7. §6 (architecture: two Pydantic models, single-table
+`run()`, algorithm, typing, error handling, the corrected staging rule) → Tasks 2, 3, 5, 6. §7
+(testing, including "no multi-row test case" and the changed failure semantics) → Task 8 (delegated)
+plus Tasks 1–6's own unit tests. §8 (deployment, two-row smoke test) → out of this plan's scope,
+owned by the tracker's Phase 7. §9 (risks) → risk #7 (new concurrent-load consideration from
+`parallelism`) is a Developer Portal/Phase 6+ decision, noted here so it isn't lost; risk #6
+(`dataTypeSupport` Dev Portal flip) likewise.
 
 **Placeholder scan:** no `TBD`/`TODO`/"add appropriate error handling" in any task body. The two
 "Note for the implementer" callouts (Task 3's `ijson.ObjectBuilder` import path, Task 5's `_data_dir`
@@ -1669,8 +1757,13 @@ attribute name) are explicit, bounded uncertainty about third-party library inte
 against a specific installed version, not vague placeholders — both name the exact fallback if the
 verified detail doesn't hold.
 
-**Type consistency:** `TableSchema_` (Task 3, Retain Cloud's own schema) vs. `keboola.component.table_schema.TableSchema`
-(Task 5's manifest schema) are deliberately named differently and the conversion function
-(`Component._to_output_schema`) is the single place they meet — checked for consistent naming across
-Tasks 3 and 5. `FetchResult`, `ColumnSchema`, `build_table_schema`, `fetch_table` signatures match
-between their Task 3 definition and every consumer in Task 5's tests/code.
+**Type consistency:** `RootConfig` → `Configuration(RootConfig)` inheritance matches spec §6 exactly
+(every field each schema emits is present on the matching model — the gate-fix this revision
+applies). `TableSchema_` (Task 3, Retain Cloud's own schema) vs.
+`keboola.component.table_schema.TableSchema` (Task 5's manifest schema) are deliberately named
+differently and the conversion function (`Component._to_output_schema`) is the single place they
+meet. `FetchResult`, `ColumnSchema`, `build_table_schema`, `fetch_table` signatures match between
+their Task 3 definition and every consumer in Task 5's tests/code — unchanged by the revision, since
+`extractor.py` always operated on one table. `test_connection`/`list_tables` in Task 4 use
+`RootConfig`; `run()` in Task 5 uses `Configuration` — checked that no task accidentally uses the
+strict model where the permissive one is required (or vice versa).

@@ -1,1 +1,1 @@
-Enter short description of the component here.
+Extracts tables from Retain Cloud via its DataAccessAPI.

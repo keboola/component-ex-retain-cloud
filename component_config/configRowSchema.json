@@ -1,1 +1,52 @@
-{}
+{
+  "type": "object",
+  "title": "Table Extraction",
+  "required": [
+    "table"
+  ],
+  "properties": {
+    "table": {
+      "type": "string",
+      "title": "Table",
+      "description": "The source table to extract into this row's output table",
+      "format": "select",
+      "enum": [],
+      "options": {
+        "async": {
+          "label": "Load Tables",
+          "action": "list_tables",
+          "autoload": [
+            "parameters.environment",
+            "parameters.tenant",
+            "parameters.username",
+            "parameters.#password"
+          ]
+        },
+        "tooltip": "Loaded from your tenant's table structure once the connection fields above are filled in. Reloads automatically if you change them."
+      },
+      "propertyOrder": 10
+    },
+    "load_type": {
+      "type": "string",
+      "title": "Load Type",
+      "description": "How this row's table is written to Storage",
+      "enum": ["full_load", "incremental_load"],
+      "options": {
+        "enum_titles": ["Full Load", "Incremental Load"],
+        "tooltip": "**Full Load** (default) overwrites the output table every run. **Incremental Load** upserts by primary key instead, but it never removes rows that were deleted upstream — this source keeps no change history to detect deletions from. If this run's primary-key uniqueness check fails for this table, the run automatically falls back to Full Load for that run only and logs a warning; it does not fail the job."
+      },
+      "default": "full_load",
+      "propertyOrder": 20
+    },
+    "page_size": {
+      "type": "integer",
+      "title": "Page Size",
+      "description": "Row cap for the first fetch call on this table",
+      "default": 20000,
+      "options": {
+        "tooltip": "This API has no page-continuation token, so this is not a literal page size — it is the row cap sent on the *first* fetch call for this table. Tables at or under this count finish in that single call. A larger table triggers one further, final call sized to its actual row count plus a small safety margin, and no more calls are made after that. Raise this only for an unusually large table, to avoid the two-call path."
+      },
+      "propertyOrder": 30
+    }
+  }
+}

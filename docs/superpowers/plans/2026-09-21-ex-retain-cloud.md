@@ -1331,6 +1331,66 @@ class TestRunOrchestration(unittest.TestCase):
         mock_build_schema.assert_not_called()
         mock_fetch_table.assert_not_called()
 
+    def _run_and_capture(self, comp):
+        """Run `comp` and capture both the `incremental` kwarg and the `primary_keys` actually
+        passed to `create_out_table_definition_from_schema` — both must be checked together,
+        since the data-loss bug this test guards against (§7 case 13) is specifically about
+        `primary_keys` being set independently of `incremental`."""
+        captured = {}
+        original = comp.create_out_table_definition_from_schema
+
+        def capture(table_schema, **kwargs):
+            captured["incremental"] = kwargs.get("incremental")
+            captured["primary_keys"] = table_schema.primary_keys
+            return original(table_schema, **kwargs)
+
+        with (
+            mock.patch.object(type(comp), "_data_dir", new_callable=mock.PropertyMock, return_value=str(self.data_dir)),
+            mock.patch.object(comp, "create_out_table_definition_from_schema", side_effect=capture),
+        ):
+            comp.run()
+        return captured
+
+    @mock.patch("component.fetch_table")
+    @mock.patch("component.build_table_schema")
+    @mock.patch("component.RetainCloudClient")
+    def test_full_load_with_nonunique_pk_declares_no_primary_key(self, mock_client_cls, mock_build_schema, mock_fetch_table):
+        # This is the direct regression test for spec §7 case 13 / the gate-fix data-loss bug: a
+        # DEFAULT full_load row (load_type not set at all) whose <table>_guid has a duplicate value
+        # this run must NOT declare a primary key — declaring one would make Storage deduplicate on
+        # import and silently drop a row every single run, on the component's default path.
+        client = mock_client_cls.return_value
+        client.list_tables.return_value = ["booking"]
+        mock_build_schema.return_value = _schema("booking")
+        mock_fetch_table.side_effect = lambda _client, table, _schema, _page_size, scratch_dir: _fetch_result(
+            scratch_dir, table, pk_unique=False
+        )
+
+        comp = self._component(ROW_PARAMS)  # load_type defaults to full_load
+        captured = self._run_and_capture(comp)
+
+        self.assertFalse(captured["incremental"])
+        self.assertIsNone(captured["primary_keys"])
+
+    @mock.patch("component.fetch_table")
+    @mock.patch("component.build_table_schema")
+    @mock.patch("component.RetainCloudClient")
+    def test_full_load_with_unique_pk_still_declares_primary_key(self, mock_client_cls, mock_build_schema, mock_fetch_table):
+        # Symmetric case: a unique PK is declared even on full_load (Storage can still dedupe
+        # within a single load), confirming the fix doesn't over-correct into never declaring a PK.
+        client = mock_client_cls.return_value
+        client.list_tables.return_value = ["booking"]
+        mock_build_schema.return_value = _schema("booking")
+        mock_fetch_table.side_effect = lambda _client, table, _schema, _page_size, scratch_dir: _fetch_result(
+            scratch_dir, table, pk_unique=True
+        )
+
+        comp = self._component(ROW_PARAMS)
+        captured = self._run_and_capture(comp)
+
+        self.assertFalse(captured["incremental"])
+        self.assertEqual(captured["primary_keys"], ["booking_guid"])
+
     @mock.patch("component.fetch_table")
     @mock.patch("component.build_table_schema")
     @mock.patch("component.RetainCloudClient")
@@ -1343,20 +1403,10 @@ class TestRunOrchestration(unittest.TestCase):
         )
 
         comp = self._component({**ROW_PARAMS, "load_type": "incremental_load"})
-        captured = {}
-        original = comp.create_out_table_definition_from_schema
-
-        def capture(table_schema, **kwargs):
-            captured["incremental"] = kwargs.get("incremental")
-            return original(table_schema, **kwargs)
-
-        with (
-            mock.patch.object(type(comp), "_data_dir", new_callable=mock.PropertyMock, return_value=str(self.data_dir)),
-            mock.patch.object(comp, "create_out_table_definition_from_schema", side_effect=capture),
-        ):
-            comp.run()  # must NOT raise — this is a fallback, not a failure
+        captured = self._run_and_capture(comp)  # must NOT raise — this is a fallback, not a failure
 
         self.assertFalse(captured["incremental"])  # fell back to full load for this run
+        self.assertIsNone(captured["primary_keys"])  # AND no PK declared — same bug, same fix
 
     @mock.patch("component.fetch_table")
     @mock.patch("component.build_table_schema")
@@ -1370,20 +1420,10 @@ class TestRunOrchestration(unittest.TestCase):
         )
 
         comp = self._component({**ROW_PARAMS, "load_type": "incremental_load"})
-        captured = {}
-        original = comp.create_out_table_definition_from_schema
-
-        def capture(table_schema, **kwargs):
-            captured["incremental"] = kwargs.get("incremental")
-            return original(table_schema, **kwargs)
-
-        with (
-            mock.patch.object(type(comp), "_data_dir", new_callable=mock.PropertyMock, return_value=str(self.data_dir)),
-            mock.patch.object(comp, "create_out_table_definition_from_schema", side_effect=capture),
-        ):
-            comp.run()
+        captured = self._run_and_capture(comp)
 
         self.assertTrue(captured["incremental"])
+        self.assertEqual(captured["primary_keys"], ["booking_guid"])
 
 
 if __name__ == "__main__":
@@ -1463,8 +1503,14 @@ class Component(ComponentBase):
                 "unique this run — falling back to full load for this run.", cfg.table,
             )
 
+        # `create_out_table_definition_from_schema`'s `incremental` kwarg is VERIFIED (not
+        # inferred) against the installed keboola-component library:
+        # `uv run python -c "import inspect; from keboola.component.base import ComponentBase;
+        # print(inspect.signature(ComponentBase.create_out_table_definition_from_schema))"` reports
+        # `(self, table_schema, is_sliced=False, destination='', incremental: bool = None,
+        # enclosure='"', delimiter=',', delete_where=None)` — `incremental` is real.
         table_def = self.create_out_table_definition_from_schema(
-            self._to_output_schema(schema),
+            self._to_output_schema(schema, result.pk_unique),
             incremental=incremental_for_table,
         )
         Path(table_def.full_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1472,10 +1518,15 @@ class Component(ComponentBase):
         self.write_manifest(table_def)
 
     @staticmethod
-    def _to_output_schema(schema: TableSchema_) -> TableSchema:
-        # The PK is declared whenever the column exists, regardless of incremental/full load —
-        # Storage can still dedupe on it within a single load either way (output-mapping.md).
-        primary_keys = [schema.pk_column] if schema.pk_column else None
+    def _to_output_schema(schema: TableSchema_, pk_unique: bool) -> TableSchema:
+        # The PK is declared ONLY when this run's uniqueness check passed (spec §6/§7 case 13) —
+        # for BOTH full and incremental load. Declaring a non-unique PK would make Storage
+        # deduplicate on the declared key at import time, silently dropping a row every run, on
+        # the component's DEFAULT (full_load) path — not just the incremental one. `pk_unique` is
+        # already False whenever `schema.pk_column` is None (extractor.py's `_stream_to_csv`
+        # computes `pk_unique = schema.pk_column is not None and len(pk_values) == row_count`), so
+        # this single condition is sufficient — no separate `schema.pk_column` check needed here.
+        primary_keys = [schema.pk_column] if pk_unique else None
         fields = [FieldSchema(name=c.name, base_type=c.base_type, nullable=True) for c in schema.columns]
         return TableSchema(name=schema.table, fields=fields, primary_keys=primary_keys)
 
@@ -1767,3 +1818,15 @@ their Task 3 definition and every consumer in Task 5's tests/code — unchanged 
 `extractor.py` always operated on one table. `test_connection`/`list_tables` in Task 4 use
 `RootConfig`; `run()` in Task 5 uses `Configuration` — checked that no task accidentally uses the
 strict model where the permissive one is required (or vice versa).
+
+**Spec↔plan cross-check (re-gate fix, this cycle):** `_to_output_schema` now takes `pk_unique` and
+sets `primary_keys` from it alone (`[schema.pk_column] if pk_unique else None`), matching spec §6's
+"the PK is kept if a `<table>_guid` column exists **and** `len(pk_values_set) == rowsProcessed`"
+precisely — for both load types, not just incremental. The prior version of this plan set
+`primary_keys` from `schema.pk_column` alone (ignoring `pk_unique` entirely except for the
+`incremental` flag), which would have declared a PK on a non-unique GUID column and caused Storage
+to silently deduplicate rows on every default full-load run — exactly the bug spec §7 case 13 exists
+to catch. Fixed, and Task 5's tests now assert `primary_keys` directly (not just `incremental`) in
+all four PK/load-type combinations. The `incremental` kwarg on
+`create_out_table_definition_from_schema` is confirmed via `inspect.signature` against the installed
+`keboola-component` library (not inferred) — see the inline comment at the call site.

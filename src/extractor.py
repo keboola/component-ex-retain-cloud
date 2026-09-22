@@ -130,7 +130,20 @@ def build_table_schema(table: str, rich_fields: list[dict]) -> TableSchema_:
     columns: list[ColumnSchema] = []
     pk_column: str | None = None
     for field_def in rich_fields:
-        name = field_def["name"]
+        # `name` is a response-schema assumption, not guaranteed. Tenant-configurable tables
+        # (e.g. the `*CustomLookup` tables) can transiently return a field with no `name` while a
+        # custom field is being created/renamed. Without this guard a `KeyError` escapes `run()`'s
+        # `RequestException`/`ijson.JSONError` handlers to `__main__`'s bare `except` → opaque exit 2
+        # ("Internal Server Error"); surface it as a clear, actionable UserException instead.
+        try:
+            name = field_def["name"]
+        except KeyError as e:
+            raise UserException(
+                f"Retain Cloud returned a field with no 'name' in the schema for table '{table}'. "
+                "This can happen transiently while a custom field is being created or renamed — "
+                "re-run the extraction; if it persists, check the table's custom-field configuration "
+                "in Retain Cloud."
+            ) from e
         declared = field_def.get("dataType", "Unknown")
         if name.lower() == pk_candidate_lower:
             pk_column = name

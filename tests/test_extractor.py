@@ -66,6 +66,18 @@ class TestBuildTableSchema(unittest.TestCase):
         schema = build_table_schema("booking", fields)
         self.assertIsNone(schema.pk_column)
 
+    def test_field_without_name_raises_user_exception_naming_the_table(self):
+        # A tenant-configurable table (e.g. jobCustomLookup) can transiently return a field entry
+        # with no "name"; that must surface as a clear UserException (exit 1) naming the table, not
+        # a raw KeyError escaping to the exit-2 "internal error" path.
+        fields = [
+            {"name": "jobCustomLookup_guid", "dataType": "ID"},
+            {"dataType": "ID"},  # malformed: no "name"
+        ]
+        with self.assertRaises(UserException) as ctx:
+            build_table_schema("jobCustomLookup", fields)
+        self.assertIn("jobCustomLookup", str(ctx.exception))
+
     def test_bool_int_float_start_as_native_candidates(self):
         schema = build_table_schema("booking", RICH_FIELDS_BOOKING)
         by_name = {c.name: c for c in schema.columns}

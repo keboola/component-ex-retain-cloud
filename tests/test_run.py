@@ -12,7 +12,7 @@ from keboola.component.dao import SupportedDataTypes
 from keboola.component.exceptions import UserException
 
 from component import Component
-from extractor import ColumnSchema, FetchResult, TableSchema_
+from extractor import ColumnSchema, FetchResult, TableSchema_, safe_column_name
 
 ROW_PARAMS = {
     "environment": "us",
@@ -57,6 +57,53 @@ def _fetch_result_with_verification(scratch_dir: Path, table: str, verified_colu
     path = scratch_dir / f"{table}.csv"
     path.write_text(f"{table}-row-1\n")
     return FetchResult(scratch_path=path, row_count=1, pk_unique=True, verified_columns=verified_columns)
+
+
+class TestToOutputSchema(unittest.TestCase):
+    """`Component._to_output_schema` is a `@staticmethod` — exercised directly here rather than
+    through the full `run()` orchestration, for Bug 1's manifest-level (column-name-shortening)
+    behavior."""
+
+    def test_short_column_name_is_unchanged_with_no_description(self):
+        schema = TableSchema_(
+            table="booking",
+            columns=[ColumnSchema(name="booking_guid", declared_type="ID", base_type=SupportedDataTypes.STRING)],
+            pk_column=None,
+        )
+        output = Component._to_output_schema(schema, pk_unique=False, verified_columns={})
+        field = output.fields[0]
+        self.assertEqual(field.name, "booking_guid")
+        self.assertIsNone(field.description)
+
+    def test_long_column_name_is_shortened_with_original_preserved_in_description(self):
+        long_name = "rolerequestresourcerejectreason_rolerequestpredefinedrejectreason_guid"
+        self.assertGreater(len(long_name), 64)
+        schema = TableSchema_(
+            table="rolerequestresourcerejectreason",
+            columns=[ColumnSchema(name=long_name, declared_type="String", base_type=SupportedDataTypes.STRING)],
+            pk_column=None,
+        )
+        output = Component._to_output_schema(schema, pk_unique=False, verified_columns={})
+        field = output.fields[0]
+        self.assertEqual(field.name, safe_column_name(long_name))
+        self.assertEqual(len(field.name), 64)
+        self.assertNotEqual(field.name, long_name)
+        self.assertIsNotNone(field.description)
+        self.assertIn(long_name, field.description or "")  # original name preserved in Storage metadata
+
+    def test_long_pk_column_name_is_shortened_in_primary_keys(self):
+        # Bug 1: the PK reference must match whatever the matching column actually ended up called
+        # in `fields` — i.e. the SHORTENED name, not the original long one.
+        long_name = "b" * 70
+        schema = TableSchema_(
+            table="booking",
+            columns=[ColumnSchema(name=long_name, declared_type="ID", base_type=SupportedDataTypes.STRING)],
+            pk_column=long_name,
+        )
+        output = Component._to_output_schema(schema, pk_unique=True, verified_columns={})
+        expected = safe_column_name(long_name)
+        self.assertEqual(output.primary_keys, [expected])
+        self.assertEqual(output.fields[0].name, expected)
 
 
 class TestRunOrchestration(unittest.TestCase):

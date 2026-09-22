@@ -27,9 +27,9 @@ from keboola.component.table_schema import FieldSchema, TableSchema
 # → `dependencies = [deprecated, keboola-vcr, pygelf]`), not assumed.
 from keboola.vcr import BaseSanitizer, DefaultSanitizer, UrlPatternSanitizer
 
-from client import RetainCloudClient
+from client import RetainCloudClient, describe_request_error
 from configuration import Configuration, RootConfig
-from extractor import TableSchema_, build_table_schema, fetch_table
+from extractor import TableSchema_, build_table_schema, fetch_table, safe_column_name
 
 logger = logging.getLogger(__name__)
 
@@ -235,15 +235,10 @@ class Component(ComponentBase):
 
     @staticmethod
     def _describe_request_failure(prefix: str, error: requests.exceptions.RequestException) -> str:
-        """Build a `UserException` message covering both an HTTP-status failure (`HTTPError`,
-        whose `.response.status_code` is reported) and a retries-exhausted/connection failure
-        (`RetryError`/`ConnectionError`/`Timeout` — none of which carry a usable `.response`, since
-        `HttpClient`'s retry adapter raises them from within the request call itself, before any
-        response exists)."""
-        status = getattr(getattr(error, "response", None), "status_code", None)
-        if status is not None:
-            return f"{prefix} (HTTP {status})."
-        return f"{prefix}: Retain Cloud API unavailable after retries."
+        """Delegates to `client.describe_request_error` — see its docstring for exactly which
+        failure shapes (timeout vs HTTP status vs connection vs retries-exhausted) map to which
+        wording."""
+        return describe_request_error(prefix, error)
 
     def _build_authenticated_client(self, cfg: RootConfig) -> RetainCloudClient:
         """Construct and authenticate a fresh client for the calling entrypoint.
@@ -267,6 +262,9 @@ class Component(ComponentBase):
         return client
 
     def _process_table(self, client: RetainCloudClient, cfg: Configuration) -> None:
+        logger.debug(
+            "Table %s: starting extraction (load_type=%s, page_size=%d).", cfg.table, cfg.load_type, cfg.page_size
+        )
         rich_fields = client.get_table_schema(cfg.table)
         schema = build_table_schema(cfg.table, rich_fields)
         result = fetch_table(client, cfg.table, schema, cfg.page_size, _SCRATCH_DIR)
@@ -303,7 +301,17 @@ class Component(ComponentBase):
         # computes `pk_unique = schema.pk_column is not None and len(pk_values) == row_count`), so
         # the explicit `schema.pk_column` check below is redundant at runtime — it's here purely to
         # narrow `str | None` to `str` for the type checker.
-        primary_keys = [schema.pk_column] if pk_unique and schema.pk_column else None
+        #
+        # `safe_column_name` shortens a name ONLY if it is over Storage's 64-char column-name cap
+        # (Retain's `<table>_<field>` naming — FKs are `<table>_<ref>_guid` — routinely exceeds it,
+        # e.g. `rolerequestresourcerejectreason_rolerequestpredefinedrejectreason_guid` = 70 chars),
+        # which used to fail the WHOLE table at Storage import. This is applied here — the manifest
+        # (Storage-facing) name — not in extractor.py, which keeps working with the API's real names
+        # throughout (row lookups, PK verification): the CSV is headerless and positional, so
+        # renaming a column at this stage never touches a single data byte, only its declared name.
+        # The PK reference is shortened the same way so it always names whatever the matching
+        # column actually ended up called in `fields` below.
+        primary_keys = [safe_column_name(schema.pk_column)] if pk_unique and schema.pk_column else None
         fields = []
         for c in schema.columns:
             # `verified_columns` only has entries for Bool/Int/Float-declared columns (extractor.py's
@@ -315,7 +323,19 @@ class Component(ComponentBase):
             # exact "declared numeric but really not" failure mode the streaming verification pass
             # exists to catch (spec §6).
             base_type = c.base_type if verified_columns.get(c.name, True) else SupportedDataTypes.STRING
-            fields.append(FieldSchema(name=c.name, base_type=base_type, nullable=True))
+            output_name = safe_column_name(c.name)
+            # The ORIGINAL name is preserved in the column's Storage metadata/description whenever it
+            # was shortened, so it stays traceable back to the source field — never silently lost.
+            description = f"Original Retain Cloud column name: {c.name}" if output_name != c.name else None
+            fields.append(FieldSchema(name=output_name, base_type=base_type, nullable=True, description=description))
+        logger.debug(
+            "Table %s: built output schema with %d columns (primary_keys=%s); %d column name(s) shortened for "
+            "Storage's 64-char limit.",
+            schema.table,
+            len(fields),
+            primary_keys,
+            sum(1 for c in schema.columns if safe_column_name(c.name) != c.name),
+        )
         return TableSchema(name=schema.table, fields=fields, primary_keys=primary_keys)
 
     @sync_action("testConnection")

@@ -1,5 +1,5 @@
 {
   "exit_code": 1,
-  "stderr": "Retain Cloud authentication failed (HTTP 400).",
+  "stderr": "Retain Cloud authentication failed: HTTP 400.",
   "logs": []
 }

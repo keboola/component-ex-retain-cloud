@@ -6,7 +6,7 @@ from unittest import mock
 
 import requests
 
-from client import ENVIRONMENT_HOSTS, RetainCloudClient, decode_jwt_exp
+from client import ENVIRONMENT_HOSTS, RetainCloudClient, decode_jwt_exp, describe_request_error
 
 
 def _fake_jwt(exp: int) -> str:
@@ -41,6 +41,44 @@ class TestDecodeJwtExp(unittest.TestCase):
     def test_reads_exp_claim(self):
         token = _fake_jwt(exp=1234567890)
         self.assertEqual(decode_jwt_exp(token), 1234567890)
+
+
+class TestDescribeRequestError(unittest.TestCase):
+    """Direct, simpler coverage of `describe_request_error` than round-tripping every case through
+    `RetainCloudClient.authenticate()` — see its docstring for the priority order these mirror."""
+
+    def test_timeout_mentions_timed_out(self):
+        error = requests.exceptions.Timeout("read timed out")
+        message = describe_request_error("Failed", error)
+        self.assertIn("timed out", message.lower())
+
+    def test_read_timeout_subclass_mentions_timed_out(self):
+        error = requests.exceptions.ReadTimeout("read timed out")
+        message = describe_request_error("Failed", error)
+        self.assertIn("timed out", message.lower())
+
+    def test_connect_timeout_mentions_timed_out_not_connection(self):
+        # `ConnectTimeout` is BOTH a `Timeout` and a `ConnectionError` subclass — the `Timeout`
+        # check must win (it runs first), so this must not fall through to the connection wording.
+        error = requests.exceptions.ConnectTimeout("connect timed out")
+        message = describe_request_error("Failed", error)
+        self.assertIn("timed out", message.lower())
+
+    def test_http_403_mentions_status_and_permission(self):
+        error = requests.HTTPError(response=mock.Mock(status_code=403))
+        message = describe_request_error("Failed", error)
+        self.assertIn("403", message)
+        self.assertIn("permission", message.lower())
+
+    def test_connection_error_mentions_connection(self):
+        error = requests.exceptions.ConnectionError("connection refused")
+        message = describe_request_error("Failed", error)
+        self.assertIn("connection", message.lower())
+
+    def test_retry_error_falls_back_to_unavailable_after_retries_wording(self):
+        error = requests.exceptions.RetryError("too many 502 retries")
+        message = describe_request_error("Failed", error)
+        self.assertIn("unavailable after retries", message.lower())
 
 
 class TestRetainCloudClientAuth(unittest.TestCase):
@@ -193,6 +231,28 @@ class TestFetchTablePage(unittest.TestCase):
         self.assertEqual(kwargs["params"], {"pageSize": 20000, "sequential": "true"})
         self.assertTrue(kwargs["stream"])
         self.assertTrue(response.raw.decode_content)
+
+    @mock.patch.object(RetainCloudClient, "post_raw")
+    def test_fail_fast_on_http_error_raises_immediately_without_retry(self, mock_post_raw):
+        # Bug 3 regression: a report-table second call sized to its full remaining row count can
+        # get a deterministic 504 — retrying it 5x (this client's normal policy) just burns 5x the
+        # wall-clock time for the same outcome. `fail_fast_on_http_error=True` must let the real
+        # HTTPError through on the FIRST attempt (no retry loop at this level) and must always
+        # restore `status_forcelist` afterwards, even though the call raised — a leaked empty
+        # forcelist would silently disable forced-status retries for every later call too.
+        original_forcelist = self.client.status_forcelist
+        response = mock.Mock(spec=requests.Response)
+        response.raw = mock.Mock()
+        response.raise_for_status.side_effect = requests.HTTPError(
+            response=mock.Mock(status_code=504, reason="Gateway Timeout")
+        )
+        mock_post_raw.return_value = response
+
+        with self.assertRaises(requests.HTTPError):
+            self.client.fetch_table_page("booking", 3500000, fail_fast_on_http_error=True)
+
+        mock_post_raw.assert_called_once()  # proves no retry loop happened at this level
+        self.assertEqual(self.client.status_forcelist, original_forcelist)  # no leak to next call
 
 
 if __name__ == "__main__":

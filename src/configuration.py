@@ -53,6 +53,14 @@ class RootConfig(BaseModel):
     tenant: str
     username: str
     password: SecretStr = Field(alias="#password")
+    # Not surfaced in configSchema.json — the platform's own base class (`keboola.component.base`)
+    # reads `parameters.debug` directly to decide whether to raise the logger to DEBUG, regardless
+    # of whether this model even has the field. It must still be MODELED here, though: this
+    # `RootConfig` (and `Configuration`, which extends it) is what actually validates
+    # `self.configuration.parameters`, and `Configuration.model_config` is `extra="forbid"` — a
+    # `debug: true` run would otherwise fail Pydantic validation before `run()` ever got a chance to
+    # do anything, rather than simply raising the log level.
+    debug: bool = False
 
     def __init__(self, **data):
         try:

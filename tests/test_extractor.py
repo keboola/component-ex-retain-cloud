@@ -8,8 +8,9 @@ from unittest import mock
 import ijson
 import requests
 from keboola.component.dao import SupportedDataTypes
+from keboola.component.exceptions import UserException
 
-from extractor import build_table_schema, fetch_table
+from extractor import build_table_schema, fetch_table, safe_column_name
 
 RICH_FIELDS_BOOKING = [
     {"name": "booking_guid", "dataType": "ID"},
@@ -78,6 +79,41 @@ class TestBuildTableSchema(unittest.TestCase):
         self.assertEqual(by_name["booking_guid"].base_type, SupportedDataTypes.STRING)
         self.assertEqual(by_name["booking_notes"].base_type, SupportedDataTypes.STRING)
         self.assertEqual(by_name["booking_meta"].base_type, SupportedDataTypes.STRING)
+
+
+class TestSafeColumnName(unittest.TestCase):
+    def test_name_under_cap_returned_unchanged(self):
+        name = "booking_guid"
+        self.assertEqual(safe_column_name(name), name)
+
+    def test_name_at_exactly_64_chars_returned_unchanged(self):
+        # Boundary case: the cap itself (`<=`, not `<`) must not be shortened.
+        name = "a" * 64
+        result = safe_column_name(name)
+        self.assertEqual(result, name)
+        self.assertEqual(len(result), 64)
+
+    def test_name_over_cap_shortened_to_exactly_64_chars(self):
+        name = "a" * 70
+        shortened = safe_column_name(name)
+        self.assertEqual(len(shortened), 64)
+        self.assertNotEqual(shortened, name)
+
+    def test_shortening_is_deterministic_across_calls(self):
+        name = "rolerequestresourcerejectreason_rolerequestpredefinedrejectreason_guid"
+        self.assertEqual(safe_column_name(name), safe_column_name(name))
+
+    def test_names_sharing_first_55_chars_do_not_collide(self):
+        # Regression: a plain truncation-only scheme would silently merge these two distinct
+        # columns into one Storage column. The hash is computed over the FULL name, so two names
+        # that agree on their first 55 characters must still diverge after shortening.
+        shared_head = "x" * 55
+        name_a = shared_head + "_first_variant_tail"
+        name_b = shared_head + "_second_variant_tail"
+        self.assertGreater(len(name_a), 64)
+        self.assertGreater(len(name_b), 64)
+        self.assertEqual(name_a[:55], name_b[:55])
+        self.assertNotEqual(safe_column_name(name_a), safe_column_name(name_b))
 
 
 class TestFetchTableSingleCall(unittest.TestCase):
@@ -171,6 +207,40 @@ class TestFetchTableSingleCall(unittest.TestCase):
         self.assertEqual(result.row_count, 3)  # final result reflects the SECOND call only
         content = result.scratch_path.read_text()
         self.assertEqual(content.count("\n"), 3)  # not 1 (first) + 3 (second) — first call discarded
+
+    def test_second_call_http_error_raises_user_exception_with_status_table_and_row_count(self):
+        # Bug 3 regression: the SECOND (rowCount-sized) call is issued with
+        # `fail_fast_on_http_error=True`, so a report table's deterministic 504 must surface here as
+        # a `requests.HTTPError` (not retried away into a `RetryError`) and `fetch_table` must turn
+        # it into a specific `UserException` naming the status, the table, and the row count that
+        # was being requested — rather than letting a generic `RequestException` propagate for
+        # `component.py` to describe more vaguely. Also confirms `fetch_table` itself does not loop
+        # around the second call (exactly 2 total calls: first + second).
+        first_rows = [
+            {
+                "booking_guid": "a",
+                "booking_hours": 1,
+                "booking_rate": 1.0,
+                "booking_active": True,
+                "booking_createdon": "2026-01-01T00:00:00Z",
+                "booking_notes": "x",
+                "booking_meta": None,
+            }
+        ]
+        client = mock.Mock()
+        client.fetch_table_page.side_effect = [
+            _envelope_response(row_count=7, rows=first_rows),  # 1 row, short of 7 -> triggers 2nd call
+            requests.HTTPError(response=mock.Mock(status_code=504, reason="Gateway Timeout")),
+        ]
+
+        with self.assertRaises(UserException) as ctx:
+            fetch_table(client, "booking", self.schema, page_size=1, scratch_dir=self.scratch_dir)
+
+        message = str(ctx.exception)
+        self.assertIn("504", message)
+        self.assertIn("booking", message)
+        self.assertIn("7", message)  # row_count_total from the first call's rowCount
+        self.assertEqual(client.fetch_table_page.call_count, 2)  # no retry loop around the 2nd call
 
     def test_pk_not_unique_falls_back_to_no_pk(self):
         rows = [

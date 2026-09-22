@@ -11,6 +11,7 @@ row-level field (see `configuration.py`).
 """
 
 import csv
+import hashlib
 import json
 import logging
 import math
@@ -22,6 +23,7 @@ from typing import Any
 import ijson
 import requests
 from keboola.component.dao import SupportedDataTypes
+from keboola.component.exceptions import UserException
 
 from client import RetainCloudClient
 
@@ -36,6 +38,51 @@ _NATIVE_TYPE_FOR: dict[str, SupportedDataTypes] = {
 }
 _MIN_SECOND_CALL_MARGIN = 1000
 _SECOND_CALL_MARGIN_RATIO = 0.02
+
+# Storage rejects (fails the WHOLE table) any column name over 64 characters. Retain's flat
+# `<table>_<field>` naming — foreign keys are `<table>_<ref>_guid` — routinely exceeds that, e.g.
+# `rolerequestresourcerejectreason_rolerequestpredefinedrejectreason_guid` (70 chars). This only
+# ever renames the OUTPUT (manifest/Storage) column name — see `safe_column_name`'s docstring.
+_MAX_STORAGE_COLUMN_NAME_LENGTH = 64
+_SHORTENED_NAME_HEAD_LENGTH = 55
+_SHORTENED_NAME_HASH_LENGTH = 8
+
+
+def safe_column_name(name: str) -> str:
+    """Shorten `name` to Storage's 64-char column-name cap, deterministically and collision-safely.
+
+    A name at or under the cap is returned UNCHANGED — source-faithful naming is preserved for the
+    overwhelming majority of columns. Only a name OVER the cap is shortened, to a fixed 55-char
+    head of the original plus an underscore plus an 8-hex-char SHA-256 prefix of the FULL original
+    name: `orig[:55] + "_" + sha256(orig).hexdigest()[:8]`, which is always exactly 64 characters.
+
+    The hash (over the full name, not just the truncated head) is what makes this collision-safe:
+    two long names that happen to share the same first 55 characters (a real risk with this API's
+    `<table>_<field>` naming) still diverge after that shared head, so their hashes — and therefore
+    their shortened names — differ. A plain truncation alone would silently merge two distinct
+    columns into one in Storage.
+
+    Deterministic and stable across runs (same input always yields the same output), so a
+    shortened name never drifts between runs of the same table/column — required for both the
+    manifest and an incremental load's primary-key reference to stay consistent run over run.
+
+    This is applied ONLY to the manifest's column names (and the primary-key reference) — never to
+    the CSV data itself, which is headerless and positional (columns are matched to the manifest by
+    ORDER, not by name), so renaming a column here never touches a single data byte.
+    """
+    if len(name) <= _MAX_STORAGE_COLUMN_NAME_LENGTH:
+        return name
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:_SHORTENED_NAME_HASH_LENGTH]
+    shortened = f"{name[:_SHORTENED_NAME_HEAD_LENGTH]}_{digest}"
+    logger.debug(
+        "Column name %r (%d chars) exceeds Storage's %d-char limit; shortened to %r (original name "
+        "preserved in the column's Storage metadata/description).",
+        name,
+        len(name),
+        _MAX_STORAGE_COLUMN_NAME_LENGTH,
+        shortened,
+    )
+    return shortened
 
 
 @dataclass
@@ -94,6 +141,9 @@ def build_table_schema(table: str, rich_fields: list[dict]) -> TableSchema_:
         else:
             base_type = SupportedDataTypes.STRING
         columns.append(ColumnSchema(name=name, declared_type=declared, base_type=base_type))
+    logger.debug(
+        "Table %s: built schema with %d columns; detected primary key column %r.", table, len(columns), pk_column
+    )
     return TableSchema_(table=table, columns=columns, pk_column=pk_column)
 
 
@@ -173,6 +223,7 @@ def _stream_to_csv(response: requests.Response, schema: TableSchema_, csv_path: 
         for kind, payload in _iter_envelope(response):
             if kind == "meta":
                 row_count_total = payload
+                logger.debug("Table %s: server reports rowCount=%d.", schema.table, row_count_total)
                 continue
             row = payload
             row_count += 1
@@ -213,6 +264,13 @@ def _stream_to_csv(response: requests.Response, schema: TableSchema_, csv_path: 
     # A null/missing PK value must never be silently treated as "the one unique value" — Storage
     # would then declare a nullable column as the primary key, which upserts can't handle safely.
     pk_unique = schema.pk_column is not None and not pk_has_null and len(pk_values) == row_count
+    logger.debug(
+        "Table %s: streamed %d rows this call (server-reported rowCount=%d, pk_unique=%s).",
+        schema.table,
+        row_count,
+        row_count_total,
+        pk_unique,
+    )
     return (
         FetchResult(scratch_path=csv_path, row_count=row_count, pk_unique=pk_unique, verified_columns=verified),
         row_count_total,
@@ -224,22 +282,54 @@ def fetch_table(
 ) -> FetchResult:
     """Fetch a table to completion into a `/tmp` scratch file (spec §6 algorithm).
 
-    Raises `requests.HTTPError` on any HTTP failure and `ijson.JSONError` on a malformed response —
-    both propagate to the caller (`component.py`), which turns this into a `UserException` for this
-    row's job rather than a per-table "log and continue" (there is no other table in this row).
+    Raises `requests.HTTPError` on any HTTP failure from the FIRST call, and `ijson.JSONError` on a
+    malformed response — both propagate to the caller (`component.py`), which turns this into a
+    `UserException` for this row's job rather than a per-table "log and continue" (there is no
+    other table in this row).
+
+    The SECOND call — sized to `row_count_total + margin`, i.e. potentially every remaining row of
+    the table in one request — is different: a report table with a very large `rowCount` (e.g.
+    `resourcenumdenreport`'s ~3.48M rows) cannot be generated and returned by the API in a single
+    request, and answers with a deterministic `504 Gateway Timeout`. Retrying that 5x (this client's
+    normal policy) would only burn ~5x the wall-clock time to reach the same outcome, so this call
+    is made with `fail_fast_on_http_error=True` (skips forced-status retries — see
+    `RetainCloudClient._no_forced_status_retries`) and its `requests.HTTPError` is caught here and
+    turned directly into a `UserException` naming the status and the row count, instead of
+    propagating as a generic `RequestException` for `component.py` to describe more vaguely.
     """
     scratch_dir.mkdir(parents=True, exist_ok=True)
     csv_path = scratch_dir / f"{table}.csv"
 
+    logger.debug("Table %s: starting fetch (page_size cap=%d).", table, page_size)
     response = client.fetch_table_page(table, page_size)
     result, row_count_total = _stream_to_csv(response, schema, csv_path)
 
     if result.row_count >= row_count_total:
+        logger.debug("Table %s: first call covered the whole table; no second call needed.", table)
         return result
 
     margin = max(_MIN_SECOND_CALL_MARGIN, math.ceil(row_count_total * _SECOND_CALL_MARGIN_RATIO))
     second_page_size = row_count_total + margin
-    response = client.fetch_table_page(table, second_page_size)
+    logger.debug(
+        "Table %s: first call short (%d < %d) — issuing second call with pageSize=%d (rowCount=%d + margin=%d).",
+        table,
+        result.row_count,
+        row_count_total,
+        second_page_size,
+        row_count_total,
+        margin,
+    )
+    try:
+        response = client.fetch_table_page(table, second_page_size, fail_fast_on_http_error=True)
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        reason = getattr(e.response, "reason", None) if e.response is not None else None
+        status_text = f"HTTP {status}" + (f" {reason}" if reason else "") if status is not None else "an HTTP error"
+        raise UserException(
+            f"Failed to fetch table '{table}': {status_text} while requesting all {row_count_total} remaining "
+            "rows in a single request — this table may be too large for the API to return as one page (a "
+            "report table can trigger slow server-side generation that a very large request times out on)."
+        ) from e
     result, row_count_total_2 = _stream_to_csv(response, schema, csv_path)
 
     if result.row_count < row_count_total_2:

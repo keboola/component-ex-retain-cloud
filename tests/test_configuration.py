@@ -42,6 +42,14 @@ class TestRootConfig(unittest.TestCase):
         with self.assertRaises(UserException):
             RootConfig(**{**ROOT_PARAMS, "environment": "ca"})
 
+    def test_debug_true_accepted_and_stored(self):
+        cfg = RootConfig(**ROOT_PARAMS, debug=True)
+        self.assertTrue(cfg.debug)
+
+    def test_debug_defaults_to_false_when_absent(self):
+        cfg = RootConfig(**ROOT_PARAMS)  # no "debug" key at all
+        self.assertFalse(cfg.debug)
+
 
 class TestConfiguration(unittest.TestCase):
     def test_valid_row_config_parses(self):
@@ -67,6 +75,12 @@ class TestConfiguration(unittest.TestCase):
         cfg = Configuration(**ROW_PARAMS)
         self.assertNotIn("secret-value", str(cfg))
         self.assertNotIn("secret-value", repr(cfg))
+
+    def test_debug_true_accepted_by_strict_row_config(self):
+        # `Configuration.model_config` is `extra="forbid"` — this confirms `debug` (inherited from
+        # `RootConfig`) is a real modeled field there too, not merely tolerated as unknown extra.
+        cfg = Configuration(**ROW_PARAMS, debug=True)
+        self.assertTrue(cfg.debug)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,23 @@
+{
+  "files": {},
+  "hash_algorithm": "sha256",
+  "tables": {
+    "billingtype.csv": {
+      "columns": [
+        "883bf2cf-6bff-4762-9cdc-13f1d67d5591",
+        "Fixed price",
+        "2"
+      ],
+      "hash": "sha256:ecbeb01ec8782bfb39928ef0041947b55129efc5701fa1a70fa54aec89d63189",
+      "row_count": 2,
+      "size_bytes": 109
+    },
+    "billingtype.csv.manifest": {
+      "columns": null,
+      "hash": "sha256:b2299391597f045e6b6d1889857b2c03d13ddc947d3b5e35ada2831089fe76eb",
+      "row_count": null,
+      "size_bytes": 661
+    }
+  },
+  "version": "1.0"
+}

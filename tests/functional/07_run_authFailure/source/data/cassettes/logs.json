@@ -1,0 +1,12 @@
+{
+  "exit_code": 1,
+  "stderr": "Component failed with a user error: Retain Cloud authentication failed: HTTP 400.\n",
+  "logs": [
+    {
+      "level": "ERROR",
+      "logger": "__main__",
+      "message": "Component failed with a user error: Retain Cloud authentication failed: HTTP 400.",
+      "timestamp": "2026-09-21T17:42:03.000Z"
+    }
+  ]
+}

@@ -1,19 +1,50 @@
 {
   "type": "object",
-  "title": "extractor configuration",
+  "title": "Retain Cloud Connection",
   "required": [
-    "print_hello"
+    "environment",
+    "tenant",
+    "username",
+    "#password"
   ],
   "properties": {
-    "print_hello": {
-      "type": "boolean",
-      "title": "Print Hello",
-      "propertyOrder": 1
+    "environment": {
+      "type": "string",
+      "title": "Environment",
+      "description": "The Retain Cloud environment hosting your tenant",
+      "enum": ["us", "eu", "uk", "aus"],
+      "options": {
+        "enum_titles": ["US", "EU", "UK", "Australia"],
+        "tooltip": "Selects the regional API host for your tenant. Ask your Retain Cloud administrator if you're not sure which environment your tenant runs on."
+      },
+      "propertyOrder": 10
     },
-    "debug": {
-      "type": "boolean",
-      "title": "Debug",
-      "propertyOrder": 2
+    "tenant": {
+      "type": "string",
+      "title": "Tenant",
+      "description": "Your Retain Cloud tenant identifier",
+      "options": {
+        "tooltip": "Case-sensitive — enter it exactly as given by your Retain Cloud administrator."
+      },
+      "propertyOrder": 20
+    },
+    "username": {
+      "type": "string",
+      "title": "Username",
+      "description": "The email or account name used to sign in to Retain Cloud",
+      "propertyOrder": 30
+    },
+    "#password": {
+      "type": "string",
+      "title": "Password",
+      "format": "password",
+      "description": "The password for the account above",
+      "propertyOrder": 40
+    },
+    "test_connection": {
+      "type": "button",
+      "format": "test-connection",
+      "propertyOrder": 50
     }
   }
 }

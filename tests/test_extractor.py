@@ -44,6 +44,27 @@ class TestBuildTableSchema(unittest.TestCase):
         schema = build_table_schema("booking", fields)
         self.assertIsNone(schema.pk_column)
 
+    def test_pk_column_matched_case_insensitively_keeps_api_casing(self):
+        # The API returns the guid column with inconsistent casing (e.g. `SkillType_guid`,
+        # `SkillLevel_Guid`) that does not equal the lowercase `<table>_guid`. The PK must still be
+        # detected, and stored with the API's ACTUAL casing so `row.get(pk_column)` works at fetch.
+        fields = [
+            {"name": "SkillLevel_Guid", "dataType": "ID"},
+            {"name": "SkillLevel_name", "dataType": "String"},
+        ]
+        schema = build_table_schema("SkillLevel", fields)
+        self.assertEqual(schema.pk_column, "SkillLevel_Guid")
+
+    def test_pk_does_not_match_a_foreign_key_guid_column(self):
+        # `<table>_<ref>_guid` foreign keys are also guids; the `<table>_guid` targeting (even
+        # case-insensitively) must not pick one of them as the primary key.
+        fields = [
+            {"name": "booking_resource_guid", "dataType": "ID"},
+            {"name": "booking_job_guid", "dataType": "ID"},
+        ]
+        schema = build_table_schema("booking", fields)
+        self.assertIsNone(schema.pk_column)
+
     def test_bool_int_float_start_as_native_candidates(self):
         schema = build_table_schema("booking", RICH_FIELDS_BOOKING)
         by_name = {c.name: c for c in schema.columns}

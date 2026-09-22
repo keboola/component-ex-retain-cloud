@@ -72,14 +72,21 @@ def build_table_schema(table: str, rich_fields: list[dict]) -> TableSchema_:
     always STRING (an ID is definitionally a string, never at risk of the "numeric but really a
     status code" failure mode).
     """
-    pk_candidate = f"{table}_guid"
+    # The table's own identity column is `<table>_guid`. We target that exact name (not just any
+    # `*_guid` column) because the flat model prefixes every column with the table name and foreign
+    # keys are ALSO guids — e.g. `booking` carries `booking_guid` (its PK) plus `booking_resource_guid`
+    # / `booking_job_guid` (FKs); matching any `_guid` column would pick an FK. The API is inconsistent
+    # about casing (`SkillType_guid`, `SkillLevel_Guid`), so compare case-insensitively and keep the
+    # column's ACTUAL name as the PK — row dicts are keyed by the real casing, so a lowercased guess
+    # would break `row.get(pk_column)` at fetch time.
+    pk_candidate_lower = f"{table}_guid".lower()
     columns: list[ColumnSchema] = []
-    has_pk_column = False
+    pk_column: str | None = None
     for field_def in rich_fields:
         name = field_def["name"]
         declared = field_def.get("dataType", "Unknown")
-        if name == pk_candidate:
-            has_pk_column = True
+        if name.lower() == pk_candidate_lower:
+            pk_column = name
         if declared == _DATETIME_TYPE:
             base_type = SupportedDataTypes.TIMESTAMP
         elif declared in _VERIFY_TYPES:
@@ -87,7 +94,7 @@ def build_table_schema(table: str, rich_fields: list[dict]) -> TableSchema_:
         else:
             base_type = SupportedDataTypes.STRING
         columns.append(ColumnSchema(name=name, declared_type=declared, base_type=base_type))
-    return TableSchema_(table=table, columns=columns, pk_column=pk_candidate if has_pk_column else None)
+    return TableSchema_(table=table, columns=columns, pk_column=pk_column)
 
 
 _BOOL_TOKENS = {True, False, "true", "false", "True", "False", "1", "0"}

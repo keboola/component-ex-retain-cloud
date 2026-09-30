@@ -1,0 +1,12 @@
+{
+  "action": "run",
+  "parameters": {
+    "environment": "us",
+    "tenant": "tenant",
+    "username": "vcr-dummy@example.com",
+    "#password": "DUMMY_PASSWORD",
+    "table": "billingtype",
+    "load_type": "full_load",
+    "page_size": 50
+  }
+}

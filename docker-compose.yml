@@ -16,4 +16,4 @@ services:
     environment:
       - KBC_DATADIR=./data
     command:
-      - python -m pytest tests/ --tb=short -q
+      - uv run pytest tests/ --tb=short -q

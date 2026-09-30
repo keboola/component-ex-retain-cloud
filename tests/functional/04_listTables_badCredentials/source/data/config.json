@@ -1,0 +1,9 @@
+{
+  "action": "list_tables",
+  "parameters": {
+    "environment": "us",
+    "tenant": "tenant",
+    "username": "not-a-real-user@example.com",
+    "#password": "definitely-wrong"
+  }
+}

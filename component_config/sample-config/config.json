@@ -2,12 +2,7 @@
   "storage": {
     "input": {
       "files": [],
-      "tables": [
-        {
-          "source": "in.c-example.example",
-          "destination": "example.csv"
-        }
-      ]
+      "tables": []
     },
     "output": {
       "files": [],
@@ -15,7 +10,12 @@
     }
   },
   "parameters": {
-    "#api_token": "your-secret-token",
-    "debug": false
+    "environment": "us",
+    "tenant": "acme",
+    "username": "svc@example.com",
+    "#password": "replace-with-a-real-password",
+    "table": "booking",
+    "load_type": "full_load",
+    "page_size": 20000
   }
 }

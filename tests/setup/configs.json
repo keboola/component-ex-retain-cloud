@@ -1,0 +1,60 @@
+[
+  {
+    "name": "01_testConnection_success",
+    "description": "SUCCESS — testConnection sync action authenticates against the live tenant and exits 0. Proves the plain-text `Bearer <jwt>` token response is parsed by decode_jwt_exp() and that the synthetic-JWT cassette substitution still replays. Record WITH --secrets.",
+    "config": {
+      "action": "testConnection",
+      "parameters": {
+        "environment": "us",
+        "tenant": "tenant",
+        "username": "vcr-dummy@example.com",
+        "#password": "DUMMY_PASSWORD"
+      }
+    }
+  },
+  {
+    "name": "03_listTables_success",
+    "description": "SUCCESS — list_tables sync action returns the tenant's table dropdown (structure + structure/tablestructure for aliases) and exits 0. The `table` field is deliberately ABSENT: this is the regression case for RootConfig's partial instantiation, since list_tables uses RootConfig (extra=ignore), not Configuration. Record WITH --secrets.",
+    "config": {
+      "action": "list_tables",
+      "parameters": {
+        "environment": "us",
+        "tenant": "tenant",
+        "username": "vcr-dummy@example.com",
+        "#password": "DUMMY_PASSWORD"
+      }
+    }
+  },
+  {
+    "name": "05_run_fullLoad_success",
+    "description": "SUCCESS — full extraction of a small reference table via run(). Exercises token auth, structure membership check, structure/richfieldstructure, and a single tableaccess/{table}/paging/paged call (page_size 50 exceeds the row count, so the two-call path stays out of this cassette). Expects an output table with rows, native types per extractor.py's rules, and a declared primary key when <table>_guid is unique. Record WITH --secrets.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "environment": "us",
+        "tenant": "tenant",
+        "username": "vcr-dummy@example.com",
+        "#password": "DUMMY_PASSWORD",
+        "table": "billingtype",
+        "load_type": "full_load",
+        "page_size": 50
+      }
+    }
+  },
+  {
+    "name": "06_run_tableNotInStructure",
+    "description": "DELIBERATE FAILURE (exit 1) — run() with a table name that is not in the tenant's structure. component.py checks client.list_tables() membership before _process_table, so the cassette must never reach paging/paged (or structure/richfieldstructure): it may only hold token POSTs plus the structure GET. Interaction count is not fixed — _ensure_token()'s 300s refresh margin can add an extra token call at record time, which the synthetic far-future JWT then suppresses on replay. Expect UserException \"Table '...' is no longer present in this tenant's structure.\" Record WITH --secrets.",
+    "config": {
+      "action": "run",
+      "parameters": {
+        "environment": "us",
+        "tenant": "tenant",
+        "username": "vcr-dummy@example.com",
+        "#password": "DUMMY_PASSWORD",
+        "table": "zzz_table_does_not_exist_xyz",
+        "load_type": "full_load",
+        "page_size": 50
+      }
+    }
+  }
+]

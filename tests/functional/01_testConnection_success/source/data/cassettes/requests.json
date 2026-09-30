@@ -1,0 +1,7 @@
+{
+  "_metadata": {"component_run_duration_seconds": 1.648, "component_run_ended_at": "2026-09-21T14:17:47.004373+00:00", "component_run_started_at": "2026-09-21T14:17:45.356602+00:00", "freeze_time": "2026-09-21T16:17:45", "keboola_vcr_version": "0.7.1", "recorded_at": "2026-09-21T14:17:47.006193+00:00", "recording_duration_seconds": 0.0, "recording_ended_at": "2026-09-21T14:17:47.002013+00:00", "recording_started_at": "2026-09-21T14:17:47.002013+00:00", "request_pairs": 1},
+  "interactions": [
+    {"request": {"body": "{\"useremail\": \"REDACTED\", \"userpassword\": \"REDACTED\", \"environment\": \"us\", \"tenant\": \"REDACTED\"}", "headers": {"Accept": ["*/*"], "Content-Length": ["96"], "Content-Type": ["application/json"]}, "method": "POST", "uri": "https://us.retaincloud.com/IntegrationApi/token"}, "response": {"body": {"string": "Bearer REDACTEDHEADER.eyJleHAiOiA5OTk5OTk5OTk5fQ.REDACTEDSIGNATURE"}, "headers": {"Content-Type": ["text/plain; charset=utf-8"], "content-length": ["66"]}, "status": {"code": 200, "message": "OK"}}}
+  ],
+  "version": 1
+}

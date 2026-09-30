@@ -8,6 +8,8 @@ dependencies = [
     "keboola-http-client>=1.0.1",
     "keboola-utils>=1.1.0",
     "pydantic>=2.11.7",
+    "ijson>=3.2.3",
+    "requests>=2.34.2",
 ]
 
 [dependency-groups]

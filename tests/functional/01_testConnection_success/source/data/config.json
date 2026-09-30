@@ -1,0 +1,9 @@
+{
+  "action": "testConnection",
+  "parameters": {
+    "environment": "us",
+    "tenant": "tenant",
+    "username": "vcr-dummy@example.com",
+    "#password": "DUMMY_PASSWORD"
+  }
+}

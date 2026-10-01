@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 import requests
+from keboola.component.exceptions import UserException
 
 from client import ENVIRONMENT_HOSTS, RetainCloudClient, decode_jwt_exp, describe_request_error
 
@@ -216,43 +217,56 @@ class TestRetainCloudClientDiscovery(unittest.TestCase):
             self.client.list_tables()
 
 
-class TestFetchTablePage(unittest.TestCase):
+class TestCreatePageResult(unittest.TestCase):
     def setUp(self):
         self.client = RetainCloudClient("us", "acme", "user@example.com", "pw")
         self.client._token_exp = int(time.time()) + 3600
 
     @mock.patch.object(RetainCloudClient, "post_raw")
-    def test_fetch_table_page_streams_and_sets_decode_content(self, mock_post_raw):
-        raw = mock.Mock()
-        raw.decode_content = False
-        mock_post_raw.return_value = _response(status_code=200, raw=raw)
-        response = self.client.fetch_table_page("booking", 20000)
-        _, kwargs = mock_post_raw.call_args
-        self.assertEqual(kwargs["params"], {"pageSize": 20000, "sequential": "true"})
-        self.assertTrue(kwargs["stream"])
-        self.assertTrue(response.raw.decode_content)
+    def test_posts_fields_body_and_returns_key_and_row_count(self, mock_post_raw):
+        mock_post_raw.return_value = _response(status_code=200, json_body={"key": "PAGEKEY", "rowCount": 42})
+
+        key, row_count = self.client.create_page_result("booking", ["booking_guid", "booking_name"])
+
+        self.assertEqual((key, row_count), ("PAGEKEY", 42))
+        args, kwargs = mock_post_raw.call_args
+        self.assertEqual(args[0], "tableaccess/booking/paging/paged")
+        # pageSize=1: we only want the handle + total here, not a big first page.
+        self.assertEqual(kwargs["params"], {"pageSize": 1, "sequential": "false"})
+        # explicit fields body is the 504-avoider; it must carry the requested columns
+        self.assertEqual(kwargs["json"], {"fields": [{"fieldName": "booking_guid"}, {"fieldName": "booking_name"}]})
 
     @mock.patch.object(RetainCloudClient, "post_raw")
-    def test_fail_fast_on_http_error_raises_immediately_without_retry(self, mock_post_raw):
-        # Bug 3 regression: a report-table second call sized to its full remaining row count can
-        # get a deterministic 504 — retrying it 5x (this client's normal policy) just burns 5x the
-        # wall-clock time for the same outcome. `fail_fast_on_http_error=True` must let the real
-        # HTTPError through on the FIRST attempt (no retry loop at this level) and must always
-        # restore `status_forcelist` afterwards, even though the call raised — a leaked empty
-        # forcelist would silently disable forced-status retries for every later call too.
-        original_forcelist = self.client.status_forcelist
-        response = mock.Mock(spec=requests.Response)
-        response.raw = mock.Mock()
-        response.raise_for_status.side_effect = requests.HTTPError(
-            response=mock.Mock(status_code=504, reason="Gateway Timeout")
-        )
-        mock_post_raw.return_value = response
+    def test_missing_key_or_row_count_raises_user_exception(self, mock_post_raw):
+        # A 200 whose body lacks `key`/`rowCount` (e.g. a vendor contract change) must surface as a
+        # clean UserException for this row, not a raw KeyError escaping to the exit-2 path.
+        mock_post_raw.return_value = _response(status_code=200, json_body={"rowCount": 5})
+        with self.assertRaises(UserException):
+            self.client.create_page_result("booking", ["booking_guid"])
 
-        with self.assertRaises(requests.HTTPError):
-            self.client.fetch_table_page("booking", 3500000, fail_fast_on_http_error=True)
 
-        mock_post_raw.assert_called_once()  # proves no retry loop happened at this level
-        self.assertEqual(self.client.status_forcelist, original_forcelist)  # no leak to next call
+class TestFetchPageWindow(unittest.TestCase):
+    def setUp(self):
+        self.client = RetainCloudClient("us", "acme", "user@example.com", "pw")
+        self.client._token_exp = int(time.time()) + 3600
+
+    @mock.patch.object(RetainCloudClient, "get_raw")
+    def test_returns_window_rows_with_id_from_and_count(self, mock_get_raw):
+        mock_get_raw.return_value = _response(status_code=200, json_body=[{"booking_guid": "a"}, {"booking_guid": "b"}])
+
+        rows = self.client.fetch_page_window("booking", "PAGEKEY", 0, 2)
+
+        self.assertEqual(rows, [{"booking_guid": "a"}, {"booking_guid": "b"}])
+        args, kwargs = mock_get_raw.call_args
+        self.assertEqual(args[0], "tableaccess/booking/paging/paged")
+        self.assertEqual(kwargs["params"], {"id": "PAGEKEY", "from": 0, "count": 2})
+
+    @mock.patch.object(RetainCloudClient, "get_raw")
+    def test_non_list_window_raises_user_exception(self, mock_get_raw):
+        # A window GET must return a JSON array; anything else is a contract break, surfaced cleanly.
+        mock_get_raw.return_value = _response(status_code=200, json_body={"unexpected": "object"})
+        with self.assertRaises(UserException):
+            self.client.fetch_page_window("booking", "PAGEKEY", 0, 2)
 
 
 if __name__ == "__main__":

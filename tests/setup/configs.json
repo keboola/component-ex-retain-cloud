@@ -27,7 +27,7 @@
   },
   {
     "name": "05_run_fullLoad_success",
-    "description": "SUCCESS — full extraction of a small reference table via run(). Exercises token auth, structure membership check, structure/richfieldstructure, and a single tableaccess/{table}/paging/paged call (page_size 50 exceeds the row count, so the two-call path stays out of this cassette). Expects an output table with rows, native types per extractor.py's rules, and a declared primary key when <table>_guid is unique. Record WITH --secrets.",
+    "description": "SUCCESS — full extraction of a small reference table via run(). Exercises token auth, structure membership check, structure/richfieldstructure, the paging/paged create call (POST pageSize=1&sequential=false with an explicit non-calculated fields body, returning a key + rowCount), and one window GET (paging/paged?id=&from=0&count=). billingtype is tiny, so a single window covers it. Expects an output table with rows, native types per extractor.py's rules, and a declared primary key when <table>_guid is unique. page_size is accepted but no longer drives the fetch. Record WITH --secrets.",
     "config": {
       "action": "run",
       "parameters": {

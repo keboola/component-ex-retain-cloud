@@ -98,7 +98,7 @@ class TestRequestContentLength(unittest.TestCase):
         self.assertNotIn("Content-Length", recorded.headers)
 
     def test_empty_json_post_body_is_left_consistent(self):
-        """`fetch_table_page` posts `json={}`; nothing to redact, so nothing may shift."""
+        """An empty JSON POST body has nothing to redact, so its declared length may not shift."""
         request = Request(
             method="POST",
             uri="https://us.retaincloud.com/DataAccessAPI/acme/api/tableaccess/billingtype/paging/paged",

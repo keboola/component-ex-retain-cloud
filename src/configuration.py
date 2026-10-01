@@ -76,7 +76,11 @@ class Configuration(RootConfig):
 
     table: str
     load_type: LoadType = LoadType.full_load
-    page_size: int = 20000
+    # Deprecated and unread. The windowed fetch uses a fixed internal window size, so page_size no
+    # longer affects extraction, and it has been removed from the UI schema. It is still ACCEPTED
+    # here (never read anywhere) only so configs created before its removal — which still carry it —
+    # keep validating under this model's extra="forbid". Drop this field once no live config sets it.
+    page_size: int | None = None
 
     @property
     def incremental(self) -> bool:

@@ -258,12 +258,10 @@ class Component(ComponentBase):
         return client
 
     def _process_table(self, client: RetainCloudClient, cfg: Configuration) -> None:
-        logger.debug(
-            "Table %s: starting extraction (load_type=%s, page_size=%d).", cfg.table, cfg.load_type, cfg.page_size
-        )
+        logger.debug("Table %s: starting extraction (load_type=%s).", cfg.table, cfg.load_type)
         rich_fields = client.get_table_schema(cfg.table)
         schema = build_table_schema(cfg.table, rich_fields)
-        result = fetch_table(client, cfg.table, schema, cfg.page_size, _SCRATCH_DIR)
+        result = fetch_table(client, cfg.table, schema, _SCRATCH_DIR)
 
         incremental_for_table = cfg.incremental and result.pk_unique
         if cfg.incremental and not result.pk_unique:

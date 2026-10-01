@@ -141,9 +141,7 @@ class TestRunOrchestration(unittest.TestCase):
         client = mock_client_cls.return_value
         client.list_tables.return_value = ["booking", "resource"]
         mock_build_schema.return_value = _schema("booking")
-        mock_fetch_table.side_effect = lambda _client, table, _schema, _page_size, scratch_dir: _fetch_result(
-            scratch_dir, table
-        )
+        mock_fetch_table.side_effect = lambda _client, table, _schema, scratch_dir: _fetch_result(scratch_dir, table)
 
         comp = self._component()
         comp.run()  # must not raise
@@ -212,7 +210,7 @@ class TestRunOrchestration(unittest.TestCase):
         client = mock_client_cls.return_value
         client.list_tables.return_value = ["booking"]
         mock_build_schema.return_value = _schema("booking")
-        mock_fetch_table.side_effect = lambda _client, table, _schema, _page_size, scratch_dir: _fetch_result(
+        mock_fetch_table.side_effect = lambda _client, table, _schema, scratch_dir: _fetch_result(
             scratch_dir, table, pk_unique=False
         )
 
@@ -233,7 +231,7 @@ class TestRunOrchestration(unittest.TestCase):
         client = mock_client_cls.return_value
         client.list_tables.return_value = ["booking"]
         mock_build_schema.return_value = _schema("booking")
-        mock_fetch_table.side_effect = lambda _client, table, _schema, _page_size, scratch_dir: _fetch_result(
+        mock_fetch_table.side_effect = lambda _client, table, _schema, scratch_dir: _fetch_result(
             scratch_dir, table, pk_unique=True
         )
 
@@ -252,7 +250,7 @@ class TestRunOrchestration(unittest.TestCase):
         client = mock_client_cls.return_value
         client.list_tables.return_value = ["booking"]
         mock_build_schema.return_value = _schema("booking")
-        mock_fetch_table.side_effect = lambda _client, table, _schema, _page_size, scratch_dir: _fetch_result(
+        mock_fetch_table.side_effect = lambda _client, table, _schema, scratch_dir: _fetch_result(
             scratch_dir, table, pk_unique=False
         )
 
@@ -269,7 +267,7 @@ class TestRunOrchestration(unittest.TestCase):
         client = mock_client_cls.return_value
         client.list_tables.return_value = ["booking"]
         mock_build_schema.return_value = _schema("booking")
-        mock_fetch_table.side_effect = lambda _client, table, _schema, _page_size, scratch_dir: _fetch_result(
+        mock_fetch_table.side_effect = lambda _client, table, _schema, scratch_dir: _fetch_result(
             scratch_dir, table, pk_unique=True
         )
 
@@ -294,8 +292,8 @@ class TestRunOrchestration(unittest.TestCase):
         client = mock_client_cls.return_value
         client.list_tables.return_value = ["booking"]
         mock_build_schema.return_value = _schema_with_int_column("booking")
-        mock_fetch_table.side_effect = lambda _client, table, _schema, _page_size, scratch_dir: (
-            _fetch_result_with_verification(scratch_dir, table, verified_columns={f"{table}_hours": False})
+        mock_fetch_table.side_effect = lambda _client, table, _schema, scratch_dir: _fetch_result_with_verification(
+            scratch_dir, table, verified_columns={f"{table}_hours": False}
         )
 
         comp = self._component(ROW_PARAMS)

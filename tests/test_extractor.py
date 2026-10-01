@@ -188,7 +188,7 @@ class TestFetchTableWindowed(unittest.TestCase):
         ]
         client = _FakeClient(rows)
 
-        result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+        result = fetch_table(client, "booking", self.schema, scratch_dir=self.scratch_dir)
 
         # create requested every (non-calculated) column, in schema order
         self.assertEqual(client.create_args, ("booking", [c.name for c in self.schema.columns]))
@@ -209,7 +209,7 @@ class TestFetchTableWindowed(unittest.TestCase):
         client = _FakeClient(rows)
 
         with mock.patch.object(extractor, "_WINDOW_CHUNK", 2):
-            result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+            result = fetch_table(client, "booking", self.schema, scratch_dir=self.scratch_dir)
 
         self.assertEqual(result.row_count, 5)
         # windows tile [0, 5) in chunks of 2 (order across worker threads is not guaranteed)
@@ -224,7 +224,7 @@ class TestFetchTableWindowed(unittest.TestCase):
         rows = [{"widget_guid": "g1", "widget_name": "Alpha"}, {"widget_guid": "g2", "widget_name": "Beta"}]
         client = _FakeClient(rows)
 
-        result = fetch_table(client, "widget", schema, page_size=20000, scratch_dir=self.scratch_dir)
+        result = fetch_table(client, "widget", schema, scratch_dir=self.scratch_dir)
 
         # create omits the calculated column (listing it returns 400 from the real API)
         self.assertEqual(client.create_args, ("widget", ["widget_guid", "widget_name"]))
@@ -236,7 +236,7 @@ class TestFetchTableWindowed(unittest.TestCase):
     def test_pk_not_unique_on_duplicate(self):
         rows = [_booking_row("dup"), _booking_row("dup")]
         client = _FakeClient(rows)
-        result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+        result = fetch_table(client, "booking", self.schema, scratch_dir=self.scratch_dir)
         self.assertFalse(result.pk_unique)
 
     def test_pk_null_value_is_not_unique(self):
@@ -244,13 +244,13 @@ class TestFetchTableWindowed(unittest.TestCase):
         # declare a nullable column as the primary key. `pk_unique` requires every PK value non-null.
         rows = [_booking_row(None)]
         client = _FakeClient(rows)
-        result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+        result = fetch_table(client, "booking", self.schema, scratch_dir=self.scratch_dir)
         self.assertFalse(result.pk_unique)
 
     def test_int_column_downgraded_to_string_on_non_numeric_value(self):
         rows = [_booking_row("a", hours="DELIVERED")]
         client = _FakeClient(rows)
-        result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+        result = fetch_table(client, "booking", self.schema, scratch_dir=self.scratch_dir)
         downgraded = {name for name, ok in result.verified_columns.items() if not ok}
         self.assertIn("booking_hours", downgraded)
 
@@ -258,7 +258,7 @@ class TestFetchTableWindowed(unittest.TestCase):
         # `int(1.0)` succeeds, but `_stringify` writes "1.0" — not a valid INTEGER CSV literal.
         rows = [_booking_row("a", hours=1.0)]
         client = _FakeClient(rows)
-        result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+        result = fetch_table(client, "booking", self.schema, scratch_dir=self.scratch_dir)
         downgraded = {name for name, ok in result.verified_columns.items() if not ok}
         self.assertIn("booking_hours", downgraded)
 
@@ -266,20 +266,20 @@ class TestFetchTableWindowed(unittest.TestCase):
         # `int(True) == 1` succeeds, but `_stringify` writes "True". A bool only coerces into a Bool.
         rows = [_booking_row("a", hours=True)]
         client = _FakeClient(rows)
-        result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+        result = fetch_table(client, "booking", self.schema, scratch_dir=self.scratch_dir)
         downgraded = {name for name, ok in result.verified_columns.items() if not ok}
         self.assertIn("booking_hours", downgraded)
 
     def test_float_column_downgraded_to_string_on_bool_value(self):
         rows = [_booking_row("a", rate=True)]
         client = _FakeClient(rows)
-        result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+        result = fetch_table(client, "booking", self.schema, scratch_dir=self.scratch_dir)
         downgraded = {name for name, ok in result.verified_columns.items() if not ok}
         self.assertIn("booking_rate", downgraded)
 
     def test_empty_table_creates_file_without_any_window_calls(self):
         client = _FakeClient([], reported_row_count=0)
-        result = fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+        result = fetch_table(client, "booking", self.schema, scratch_dir=self.scratch_dir)
         self.assertEqual(result.row_count, 0)
         self.assertTrue(result.scratch_path.exists())
         self.assertEqual(client.window_calls, [])  # no windows fetched for a zero-row table
@@ -290,7 +290,7 @@ class TestFetchTableWindowed(unittest.TestCase):
         client = _FakeClient([_booking_row(g) for g in ("a", "b", "c")], reported_row_count=5)
         # patch sleep so the retry backoff does not actually wait during the test
         with mock.patch.object(extractor.time, "sleep"), self.assertRaises(UserException) as ctx:
-            fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+            fetch_table(client, "booking", self.schema, scratch_dir=self.scratch_dir)
         message = str(ctx.exception)
         self.assertIn("booking", message)
         self.assertIn("too few rows", message)
@@ -303,7 +303,7 @@ class TestFetchTableWindowed(unittest.TestCase):
             mock.patch.object(extractor, "_fetch_window", return_value=[_booking_row("a")]),
             self.assertRaises(UserException) as ctx,
         ):
-            fetch_table(client, "booking", self.schema, page_size=20000, scratch_dir=self.scratch_dir)
+            fetch_table(client, "booking", self.schema, scratch_dir=self.scratch_dir)
         message = str(ctx.exception)
         self.assertIn("1", message)  # extracted
         self.assertIn("3", message)  # reported
@@ -313,7 +313,7 @@ class TestFetchTableWindowed(unittest.TestCase):
         schema = build_table_schema("calc_only", fields)
         client = _FakeClient([])
         with self.assertRaises(UserException) as ctx:
-            fetch_table(client, "calc_only", schema, page_size=20000, scratch_dir=self.scratch_dir)
+            fetch_table(client, "calc_only", schema, scratch_dir=self.scratch_dir)
         self.assertIn("no non-calculated columns", str(ctx.exception))
 
 

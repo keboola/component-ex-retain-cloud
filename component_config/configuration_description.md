@@ -20,9 +20,6 @@ Storage; each row runs and can be re-run independently.
   reflected in Storage. **Incremental Load** upserts by primary key instead — it never removes rows
   deleted upstream, and automatically falls back to a full load for a given run if that run's
   primary-key uniqueness check fails.
-- **Page Size** — the row cap sent on the table's first fetch call (default 20000). Most tables
-  finish in this single call; a larger table triggers exactly one further, final call sized to its
-  actual row count. Raise this only for an unusually large table.
 
 ### Output
 

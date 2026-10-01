@@ -74,7 +74,6 @@ Configuration
 |---|---|---|
 | Table | yes | The source table to extract, selected from a dropdown populated from your tenant's live table list once the connection fields above are filled in. |
 | Load Type | no (default Full Load) | **Full Load** overwrites the output table every run. **Incremental Load** upserts by primary key instead, but never removes rows deleted upstream — if this run's primary-key uniqueness check fails for the table, the row automatically falls back to Full Load for that run and logs a warning; it does not fail the job. |
-| Page Size | no (default 20000) | The row cap used on this table's first fetch call. This API has no page-continuation token, so it is not a literal "page size" — most tables finish in this one call; a larger table triggers exactly one further call sized to its actual row count. |
 
 Output
 ======

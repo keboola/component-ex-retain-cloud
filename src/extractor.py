@@ -320,19 +320,13 @@ def _fetch_window(client: RetainCloudClient, table: str, key: str, start: int, w
     )
 
 
-def fetch_table(
-    client: RetainCloudClient, table: str, schema: TableSchema_, page_size: int, scratch_dir: Path
-) -> FetchResult:
+def fetch_table(client: RetainCloudClient, table: str, schema: TableSchema_, scratch_dir: Path) -> FetchResult:
     """Fetch a whole table into a `/tmp` scratch file using Retain's windowed paging contract.
 
     Creates a server-side paged result set (`create_page_result`), then pulls it in fixed-size
     windows (`_WINDOW_CHUNK`) with `_WINDOW_WORKERS` concurrent GETs. Windows are submitted in
     bounded batches and consumed in offset order, so at most ~2x the worker count of windows are
     buffered at once and the output row order stays deterministic.
-
-    `page_size` is accepted for signature stability with the caller but no longer drives the fetch —
-    the window size is fixed (`_WINDOW_CHUNK`), because the old meaning (a single-call row cap) does
-    not exist in the windowed model.
 
     Fails loud (`UserException`) if the number of rows extracted does not match the `rowCount` the
     create call reported — a mismatch means a window was lost or the result set changed under us, and

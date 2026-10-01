@@ -27,7 +27,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 from keboola.component.dao import SupportedDataTypes
 from keboola.component.exceptions import UserException
@@ -238,9 +238,22 @@ class _RowConsumer:
         self._pk_has_null = False
         self.row_count = 0
         self._schema_drift_logged = False
-        # Held open across many window batches and closed in finish(), so a with-block won't fit.
+        # Held open across many window batches; use `_RowConsumer` as a context manager (or call
+        # close()) so the handle is released even if a window fetch raises before finish().
         self._file = open(csv_path, "w", encoding="utf-8", newline="")  # noqa: SIM115
         self._writer = csv.writer(self._file)
+        self._closed = False
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc_info) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if not self._closed:
+            self._file.close()
+            self._closed = True
 
     def consume(self, rows: list[dict]) -> None:
         for row in rows:
@@ -271,7 +284,7 @@ class _RowConsumer:
                     self._pk_values.add(pk_value)
 
     def finish(self) -> FetchResult:
-        self._file.close()
+        self.close()
         # A null/missing PK value must never be silently treated as "the one unique value" — Storage
         # would then declare a nullable column as the primary key, which upserts can't handle safely.
         pk_unique = (
@@ -346,20 +359,25 @@ def fetch_table(
         _WINDOW_WORKERS,
     )
 
-    consumer = _RowConsumer(schema, csv_path)
-    if row_count_total > 0:
-        offsets = list(range(0, row_count_total, _WINDOW_CHUNK))
-        batch_span = _WINDOW_WORKERS * 2
-        with ThreadPoolExecutor(max_workers=_WINDOW_WORKERS) as pool:
-            for i in range(0, len(offsets), batch_span):
-                batch = offsets[i : i + batch_span]
-                futures = [
-                    pool.submit(_fetch_window, client, table, key, start, min(_WINDOW_CHUNK, row_count_total - start))
-                    for start in batch
-                ]
-                for future in futures:
-                    consumer.consume(future.result())
-    result = consumer.finish()
+    # The context manager guarantees the scratch file is closed even if a window fetch raises
+    # before finish() (e.g. a persistently short window) — the job then fails without leaking the
+    # handle, and the partial file is never moved to out/tables/ (component.py only moves on success).
+    with _RowConsumer(schema, csv_path) as consumer:
+        if row_count_total > 0:
+            offsets = list(range(0, row_count_total, _WINDOW_CHUNK))
+            batch_span = _WINDOW_WORKERS * 2
+            with ThreadPoolExecutor(max_workers=_WINDOW_WORKERS) as pool:
+                for i in range(0, len(offsets), batch_span):
+                    batch = offsets[i : i + batch_span]
+                    futures = [
+                        pool.submit(
+                            _fetch_window, client, table, key, start, min(_WINDOW_CHUNK, row_count_total - start)
+                        )
+                        for start in batch
+                    ]
+                    for future in futures:
+                        consumer.consume(future.result())
+        result = consumer.finish()
 
     if result.row_count != row_count_total:
         raise UserException(

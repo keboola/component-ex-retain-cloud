@@ -268,6 +268,14 @@ class TestFetchPageWindow(unittest.TestCase):
         with self.assertRaises(UserException):
             self.client.fetch_page_window("booking", "PAGEKEY", 0, 2)
 
+    @mock.patch.object(RetainCloudClient, "get_raw")
+    def test_window_with_non_object_element_raises_user_exception(self, mock_get_raw):
+        # A valid JSON array can still carry a non-object (e.g. `[null]`); without the guard the
+        # consumer's `row.get(...)` would raise AttributeError and exit 2 instead of a clean error.
+        mock_get_raw.return_value = _response(status_code=200, json_body=[{"booking_guid": "a"}, None])
+        with self.assertRaises(UserException):
+            self.client.fetch_page_window("booking", "PAGEKEY", 0, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

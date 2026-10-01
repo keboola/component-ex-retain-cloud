@@ -116,6 +116,10 @@ class RetainCloudClient(HttpClient):
         # Guards token refresh so concurrent window fetches (extractor.fetch_table uses a thread
         # pool) cannot re-authenticate at the same time and race on the shared auth header.
         self._auth_lock = threading.Lock()
+        # Bumped on every successful authenticate(). Lets a 401 retry COALESCE: a worker only
+        # re-authenticates if the token has not already changed since its own request went out, so N
+        # concurrent 401s trigger ONE reauth, not N serial ones.
+        self._token_version = 0
 
     def _request_raw(self, method: str, endpoint_path: str | None = None, **kwargs) -> requests.Response:
         """Apply `_DEFAULT_TIMEOUT` to every request this client makes, unless a caller overrides it."""
@@ -171,6 +175,7 @@ class RetainCloudClient(HttpClient):
                 "Retain Cloud authentication succeeded but returned an unrecognized token format."
             ) from e
         self.update_auth_header({"Authorization": token_body}, overwrite=True)
+        self._token_version += 1
 
     def _ensure_token(self) -> None:
         # Double-checked locking: the common case (token still valid) stays lock-free, but once a
@@ -181,6 +186,18 @@ class RetainCloudClient(HttpClient):
                 if self._token_exp - time.time() < _TOKEN_REFRESH_MARGIN_SECONDS:
                     self.authenticate()
 
+    def _reauth_if_stale(self, seen_version: int) -> None:
+        """Re-authenticate for a 401, but only if no other thread already has.
+
+        `seen_version` is the token version in effect when the caller's request went out. Under the
+        lock, we re-authenticate only when the version has not moved since — so several workers that
+        all get a 401 from the same rotated token trigger a single reauth, and the rest just retry
+        with the token the winner fetched.
+        """
+        with self._auth_lock:
+            if self._token_version == seen_version:
+                self.authenticate()
+
     def _get_with_reauth(self, path: str, **kwargs):
         # Deliberately `get_raw` (undecorated), not `get` — `HttpClient.get`'s
         # `response_error_handling` decorator unconditionally logs a WARNING with a full traceback
@@ -188,14 +205,14 @@ class RetainCloudClient(HttpClient):
         # reauth-and-retry below. `get_raw` does no such logging, matching the manual
         # `raise_for_status()` pattern `fetch_table_page` already uses with `post_raw`.
         logger.debug("Retain Cloud: GET %s", path)
+        seen_version = self._token_version
         response = self.get_raw(path, **kwargs)
         try:
             response.raise_for_status()
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 401:
                 logger.info("Retain Cloud token expired mid-request for %s; re-authenticating and retrying.", path)
-                with self._auth_lock:
-                    self.authenticate()
+                self._reauth_if_stale(seen_version)
                 response = self.get_raw(path, **kwargs)
                 response.raise_for_status()
             else:
@@ -220,18 +237,19 @@ class RetainCloudClient(HttpClient):
 
         The POST analogue of `_get_with_reauth`. Uses `post_raw` (undecorated) for the same reason —
         to skip `HttpClient.post`'s unconditional WARNING-with-traceback on the 401 this handles
-        gracefully. The 401 reauth takes `_auth_lock` so concurrent callers do not race on it.
+        gracefully. The 401 reauth coalesces via `_reauth_if_stale` so concurrent callers that all
+        get a 401 from the same rotated token trigger a single reauth, not one each.
         """
         logger.debug("Retain Cloud: POST %s", path)
         body = json_body if json_body is not None else {}
+        seen_version = self._token_version
         response = self.post_raw(path, params=params, json=body)
         try:
             response.raise_for_status()
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 401:
                 logger.info("Retain Cloud token expired mid-request for %s; re-authenticating and retrying.", path)
-                with self._auth_lock:
-                    self.authenticate()
+                self._reauth_if_stale(seen_version)
                 response = self.post_raw(path, params=params, json=body)
                 response.raise_for_status()
             else:
@@ -289,4 +307,10 @@ class RetainCloudClient(HttpClient):
         rows = self._get_with_reauth(path, params=params)
         if not isinstance(rows, list):
             raise UserException(f"Retain Cloud returned a non-array window for table '{table}' (from={start}).")
+        if not all(isinstance(row, dict) for row in rows):
+            # A valid JSON array can still carry non-objects (e.g. `[null]`); without this guard the
+            # consumer's `row.get(...)` would raise AttributeError and exit 2 instead of a clean error.
+            raise UserException(
+                f"Retain Cloud returned a non-object row in a window for table '{table}' (from={start})."
+            )
         return rows

@@ -55,13 +55,19 @@ class TestConfiguration(unittest.TestCase):
     def test_valid_row_config_parses(self):
         cfg = Configuration(**ROW_PARAMS)
         self.assertEqual(cfg.table, "booking")
-        self.assertEqual(cfg.page_size, 20000)
         self.assertEqual(cfg.load_type, LoadType.full_load)
         self.assertFalse(cfg.incremental)
 
     def test_incremental_load_type(self):
         cfg = Configuration(**{**ROW_PARAMS, "load_type": "incremental_load"})
         self.assertTrue(cfg.incremental)
+
+    def test_legacy_page_size_is_tolerated(self):
+        # page_size was removed from the UI schema, but the strict (extra="forbid") row model must
+        # still ACCEPT a leftover page_size from a config created before the removal, so those
+        # existing configs keep validating. It is a deprecated, unread field.
+        cfg = Configuration(**ROW_PARAMS, page_size=20000)
+        self.assertEqual(cfg.table, "booking")
 
     def test_missing_table_raises_user_exception(self):
         with self.assertRaises(UserException):

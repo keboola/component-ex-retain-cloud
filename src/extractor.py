@@ -1,27 +1,34 @@
-"""Per-table streaming fetch + native-type verification for keboola.ex-retain-cloud.
+"""Per-table windowed fetch + native-type verification for keboola.ex-retain-cloud.
 
-Implements the resolved `paging/paged` contract (spec §6): `pageSize` is a single-call row cap, not
-a page window. Every response streams into a `/tmp` scratch file — never directly into
-`/data/out/tables/` — so a failed second call never leaves a partial/truncated file for Storage to
-upload (see the spec's "Corrected staging rule").
+Implements Retain's real `paging/paged` contract (verified live, 2026-10):
 
-V1 only ever implements `full_fetch` (spec §2's sanctioned Fetch-Mode omission) — there is no
-`fetch_mode` field or constant anywhere in this component, unlike `load_type`, which is a real
-row-level field (see `configuration.py`).
+1. `create_page_result` POSTs an explicit `fields` list and gets back a `key` (a handle to a
+   server-side, cached result set) plus the table's total `rowCount`.
+2. `fetch_table` reads that result set in fixed-size windows via concurrent
+   `GET ...?id={key}&from={offset}&count={n}` calls, and streams every window straight into a
+   `/tmp` scratch file — never directly into `/data/out/tables/`, so a mid-fetch failure never
+   leaves a partial file for Storage to upload.
+
+This replaces the earlier single-call model (one `paging/paged` POST sized to the whole table),
+which could not page the large report tables at all: a request for a whole big table deterministically
+`504`s at the gateway's ~20s limit. Windowing removes that ceiling — the big report tables are now
+fully extractable.
+
+V1 only ever implements `full_fetch` — there is no `fetch_mode` field or constant anywhere in this
+component, unlike `load_type`, which is a real row-level field (see `configuration.py`).
 """
 
 import csv
 import hashlib
 import json
 import logging
-import math
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
-import ijson
-import requests
 from keboola.component.dao import SupportedDataTypes
 from keboola.component.exceptions import UserException
 
@@ -36,8 +43,14 @@ _NATIVE_TYPE_FOR: dict[str, SupportedDataTypes] = {
     "Int": SupportedDataTypes.INTEGER,
     "Float": SupportedDataTypes.FLOAT,
 }
-_MIN_SECOND_CALL_MARGIN = 1000
-_SECOND_CALL_MARGIN_RATIO = 0.02
+# Windowed-paging tuning. 3000 rows/window and 6 concurrent windows are the values proven against
+# the live API on the three large report tables (1.2M–3.5M rows): small enough that a single window
+# GET returns well inside the ~20s gateway limit, parallel enough to finish a multi-million-row
+# table in minutes rather than hours. A short window (fewer rows than asked for) is retried a few
+# times before the table is failed.
+_WINDOW_CHUNK = 3000
+_WINDOW_WORKERS = 6
+_WINDOW_RETRIES = 6
 
 # Storage rejects (fails the WHOLE table) any column name over 64 characters. Retain's flat
 # `<table>_<field>` naming — foreign keys are `<table>_<ref>_guid` — routinely exceeds that, e.g.
@@ -90,6 +103,11 @@ class ColumnSchema:
     name: str
     declared_type: str
     base_type: SupportedDataTypes
+    # True for a Retain `CalculatedField`. Such a column must NOT be listed in the `paging/paged`
+    # create body (the API rejects it with a 400), so it is excluded from the fetch — but it stays
+    # in the output manifest (emitted empty), matching the released component, whose single-call
+    # projection never returned calculated fields either.
+    is_calculated: bool = False
 
 
 @dataclass
@@ -145,6 +163,7 @@ def build_table_schema(table: str, rich_fields: list[dict]) -> TableSchema_:
                 "in Retain Cloud."
             ) from e
         declared = field_def.get("dataType", "Unknown")
+        is_calculated = field_def.get("uiFieldCategory") == "CalculatedField"
         if name.lower() == pk_candidate_lower:
             pk_column = name
         if declared == _DATETIME_TYPE:
@@ -153,9 +172,16 @@ def build_table_schema(table: str, rich_fields: list[dict]) -> TableSchema_:
             base_type = _NATIVE_TYPE_FOR[declared]
         else:
             base_type = SupportedDataTypes.STRING
-        columns.append(ColumnSchema(name=name, declared_type=declared, base_type=base_type))
+        columns.append(
+            ColumnSchema(name=name, declared_type=declared, base_type=base_type, is_calculated=is_calculated)
+        )
+    calculated = sum(1 for c in columns if c.is_calculated)
     logger.debug(
-        "Table %s: built schema with %d columns; detected primary key column %r.", table, len(columns), pk_column
+        "Table %s: built schema with %d columns (%d calculated, excluded from fetch); detected primary key column %r.",
+        table,
+        len(columns),
+        calculated,
+        pk_column,
     )
     return TableSchema_(table=table, columns=columns, pk_column=pk_column)
 
@@ -193,164 +219,164 @@ def _stringify(value: Any) -> str:
     return str(value)
 
 
-def _iter_envelope(response: requests.Response):
-    """Yield ("meta", row_count:int) once, then ("row", dict) for every element of `data`.
+class _RowConsumer:
+    """Accumulates fetched rows into the scratch CSV while tracking native-type and PK state.
 
-    Uses `ijson.parse` + `ijson.ObjectBuilder` rather than `ijson.items`, because we need BOTH the
-    scalar `rowCount` sibling key and the streamed `data` array elements from the same single-pass
-    response body — `ijson.items(f, "data.item")` alone only yields the matched array elements and
-    silently discards sibling scalars.
+    Fed from the main thread only (window GETs run in worker threads, but their results are consumed
+    in offset order on the main thread), so the CSV writer and the `set`/counters below need no
+    locking. Carries the exact per-row logic the old streaming path had: native-type downgrade on a
+    non-coercing value, primary-key null detection and uniqueness, and a one-shot schema-drift warning.
     """
-    builder: ijson.ObjectBuilder | None = None
-    depth = 0
-    for prefix, event, value in ijson.parse(response.raw):
-        if prefix == "rowCount" and event == "number":
-            yield "meta", int(value)
-            continue
-        if prefix == "data.item" and event == "start_map":
-            builder = ijson.ObjectBuilder()
-            depth = 0
-        if builder is not None:
-            builder.event(event, value)
-            if event == "start_map":
-                depth += 1
-            elif event == "end_map":
-                depth -= 1
-                if depth == 0 and prefix == "data.item":
-                    yield "row", builder.value
-                    builder = None
 
+    def __init__(self, schema: TableSchema_, csv_path: Path):
+        self._schema = schema
+        self._csv_path = csv_path
+        self._fieldnames = [c.name for c in schema.columns]
+        self._declared_by_name = {c.name: c.declared_type for c in schema.columns}
+        self.verified = {c.name: True for c in schema.columns if c.declared_type in _VERIFY_TYPES}
+        self._pk_values: set = set()
+        self._pk_has_null = False
+        self.row_count = 0
+        self._schema_drift_logged = False
+        # Held open across many window batches; use `_RowConsumer` as a context manager (or call
+        # close()) so the handle is released even if a window fetch raises before finish().
+        self._file = open(csv_path, "w", encoding="utf-8", newline="")  # noqa: SIM115
+        self._writer = csv.writer(self._file)
+        self._closed = False
 
-def _stream_to_csv(response: requests.Response, schema: TableSchema_, csv_path: Path) -> tuple[FetchResult, int]:
-    fieldnames = [c.name for c in schema.columns]
-    declared_by_name = {c.name: c.declared_type for c in schema.columns}
-    verified = {c.name: True for c in schema.columns if c.declared_type in _VERIFY_TYPES}
-    pk_values: set = set()
-    pk_has_null = False
-    row_count = 0
-    row_count_total: int | None = None
-    schema_drift_logged = False
+    def __enter__(self) -> Self:
+        return self
 
-    with open(csv_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        for kind, payload in _iter_envelope(response):
-            if kind == "meta":
-                row_count_total = payload
-                logger.debug("Table %s: server reports rowCount=%d.", schema.table, row_count_total)
-                continue
-            row = payload
-            row_count += 1
-            extra_keys = set(row) - set(fieldnames)
-            if extra_keys and not schema_drift_logged:
+    def __exit__(self, *_exc_info) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if not self._closed:
+            self._file.close()
+            self._closed = True
+
+    def consume(self, rows: list[dict]) -> None:
+        for row in rows:
+            self.row_count += 1
+            extra_keys = set(row) - set(self._fieldnames)
+            if extra_keys and not self._schema_drift_logged:
                 logger.warning(
                     "Table %s: row carries fields outside the discovered schema: %s",
-                    schema.table,
+                    self._schema.table,
                     sorted(extra_keys),
                 )
-                schema_drift_logged = True
-            for name, still_verified in verified.items():
-                if still_verified and not _coerces(declared_by_name[name], row.get(name)):
-                    verified[name] = False
+                self._schema_drift_logged = True
+            for name, still_verified in self.verified.items():
+                if still_verified and not _coerces(self._declared_by_name[name], row.get(name)):
+                    self.verified[name] = False
                     logger.warning(
                         "Table %s column %s: value did not match declared type %s, downgrading to STRING",
-                        schema.table,
+                        self._schema.table,
                         name,
-                        declared_by_name[name],
+                        self._declared_by_name[name],
                     )
-            writer.writerow([_stringify(row.get(name)) for name in fieldnames])
-            if schema.pk_column:
-                pk_value = row.get(schema.pk_column)
+            self._writer.writerow([_stringify(row.get(name)) for name in self._fieldnames])
+            if self._schema.pk_column:
+                pk_value = row.get(self._schema.pk_column)
                 if pk_value is None:
-                    pk_has_null = True
+                    self._pk_has_null = True
                 else:
-                    pk_values.add(pk_value)
+                    self._pk_values.add(pk_value)
 
-    if row_count_total is None:
-        # The envelope never carried a `rowCount` sibling scalar at all — not "zero rows", which
-        # would still yield a `("meta", 0)` event, but the key/event never firing. Treating that as
-        # "0 rows expected" (the old default) would make `fetch_table`'s `row_count >= row_count_total`
-        # trivially true for any response, silently accepting a truncated first page as the whole
-        # table. Raising here reuses the existing `ijson.JSONError` → `UserException` contract
-        # (`component.py`'s `_process_table` handler) instead of inventing a new failure mode.
-        raise ijson.JSONError(f"Table {schema.table}: response envelope did not include a 'rowCount' value.")
+    def finish(self) -> FetchResult:
+        self.close()
+        # A null/missing PK value must never be silently treated as "the one unique value" — Storage
+        # would then declare a nullable column as the primary key, which upserts can't handle safely.
+        pk_unique = (
+            self._schema.pk_column is not None and not self._pk_has_null and len(self._pk_values) == self.row_count
+        )
+        return FetchResult(
+            scratch_path=self._csv_path,
+            row_count=self.row_count,
+            pk_unique=pk_unique,
+            verified_columns=self.verified,
+        )
 
-    # A null/missing PK value must never be silently treated as "the one unique value" — Storage
-    # would then declare a nullable column as the primary key, which upserts can't handle safely.
-    pk_unique = schema.pk_column is not None and not pk_has_null and len(pk_values) == row_count
-    logger.debug(
-        "Table %s: streamed %d rows this call (server-reported rowCount=%d, pk_unique=%s).",
-        schema.table,
-        row_count,
-        row_count_total,
-        pk_unique,
+
+def _fetch_window(client: RetainCloudClient, table: str, key: str, start: int, want: int) -> list[dict]:
+    """Fetch exactly `want` rows starting at `start`, retrying a short read a few times.
+
+    A window GET occasionally returns fewer rows than asked for (transient server behaviour). We
+    retry with a slightly larger `count` and a short backoff; if it is still short after
+    `_WINDOW_RETRIES`, the table fails loud rather than ship a gap.
+    """
+    count = want
+    last = None
+    for attempt in range(_WINDOW_RETRIES):
+        rows = client.fetch_page_window(table, key, start, count)
+        if len(rows) >= want:
+            return rows[:want]
+        last = f"{len(rows)}/{want}"
+        count = want + 1 + attempt
+        time.sleep(1 + attempt)
+    raise UserException(
+        f"Failed to fetch table '{table}': window from={start} returned too few rows ({last}) "
+        f"after {_WINDOW_RETRIES} attempts."
     )
-    return (
-        FetchResult(scratch_path=csv_path, row_count=row_count, pk_unique=pk_unique, verified_columns=verified),
-        row_count_total,
-    )
 
 
-def fetch_table(
-    client: RetainCloudClient, table: str, schema: TableSchema_, page_size: int, scratch_dir: Path
-) -> FetchResult:
-    """Fetch a table to completion into a `/tmp` scratch file (spec §6 algorithm).
+def fetch_table(client: RetainCloudClient, table: str, schema: TableSchema_, scratch_dir: Path) -> FetchResult:
+    """Fetch a whole table into a `/tmp` scratch file using Retain's windowed paging contract.
 
-    Raises `requests.HTTPError` on any HTTP failure from the FIRST call, and `ijson.JSONError` on a
-    malformed response — both propagate to the caller (`component.py`), which turns this into a
-    `UserException` for this row's job rather than a per-table "log and continue" (there is no
-    other table in this row).
+    Creates a server-side paged result set (`create_page_result`), then pulls it in fixed-size
+    windows (`_WINDOW_CHUNK`) with `_WINDOW_WORKERS` concurrent GETs. Windows are submitted in
+    bounded batches and consumed in offset order, so at most ~2x the worker count of windows are
+    buffered at once and the output row order stays deterministic.
 
-    The SECOND call — sized to `row_count_total + margin`, i.e. potentially every remaining row of
-    the table in one request — is different: a report table with a very large `rowCount` (e.g.
-    `resourcenumdenreport`'s ~3.48M rows) cannot be generated and returned by the API in a single
-    request, and answers with a deterministic `504 Gateway Timeout`. Retrying that 5x (this client's
-    normal policy) would only burn ~5x the wall-clock time to reach the same outcome, so this call
-    is made with `fail_fast_on_http_error=True` (skips forced-status retries — see
-    `RetainCloudClient._no_forced_status_retries`) and its `requests.HTTPError` is caught here and
-    turned directly into a `UserException` naming the status and the row count, instead of
-    propagating as a generic `RequestException` for `component.py` to describe more vaguely.
+    Fails loud (`UserException`) if the number of rows extracted does not match the `rowCount` the
+    create call reported — a mismatch means a window was lost or the result set changed under us, and
+    shipping a silent partial is exactly what this component must not do. HTTP failures from any call
+    propagate as `requests.exceptions.RequestException` for `component.py` to describe.
     """
     scratch_dir.mkdir(parents=True, exist_ok=True)
     csv_path = scratch_dir / f"{table}.csv"
 
-    logger.debug("Table %s: starting fetch (page_size cap=%d).", table, page_size)
-    response = client.fetch_table_page(table, page_size)
-    result, row_count_total = _stream_to_csv(response, schema, csv_path)
-
-    if result.row_count >= row_count_total:
-        logger.debug("Table %s: first call covered the whole table; no second call needed.", table)
-        return result
-
-    margin = max(_MIN_SECOND_CALL_MARGIN, math.ceil(row_count_total * _SECOND_CALL_MARGIN_RATIO))
-    second_page_size = row_count_total + margin
+    # Calculated fields are excluded: the create call returns 400 if one is listed. They stay in the
+    # output manifest (emitted empty by _RowConsumer, which writes every schema column) — matching the
+    # released component, whose projection never returned calculated fields either.
+    field_names = [c.name for c in schema.columns if not c.is_calculated]
+    if not field_names:
+        raise UserException(f"Failed to fetch table '{table}': it has no non-calculated columns to request.")
+    key, row_count_total = client.create_page_result(table, field_names)
     logger.debug(
-        "Table %s: first call short (%d < %d) — issuing second call with pageSize=%d (rowCount=%d + margin=%d).",
+        "Table %s: created paged result (rowCount=%d, requested %d/%d columns, window=%d, workers=%d).",
         table,
-        result.row_count,
         row_count_total,
-        second_page_size,
-        row_count_total,
-        margin,
+        len(field_names),
+        len(schema.columns),
+        _WINDOW_CHUNK,
+        _WINDOW_WORKERS,
     )
-    try:
-        response = client.fetch_table_page(table, second_page_size, fail_fast_on_http_error=True)
-    except requests.HTTPError as e:
-        status = e.response.status_code if e.response is not None else None
-        reason = getattr(e.response, "reason", None) if e.response is not None else None
-        status_text = f"HTTP {status}" + (f" {reason}" if reason else "") if status is not None else "an HTTP error"
-        raise UserException(
-            f"Failed to fetch table '{table}': {status_text} while requesting all {row_count_total} remaining "
-            "rows in a single request — this table may be too large for the API to return as one page (a "
-            "report table can trigger slow server-side generation that a very large request times out on)."
-        ) from e
-    result, row_count_total_2 = _stream_to_csv(response, schema, csv_path)
 
-    if result.row_count < row_count_total_2:
-        logger.warning(
-            "Table %s: second paging/paged call still short of its own rowCount (%s < %s) — "
-            "treating this run as best-effort complete; the next run will pick up any tail rows.",
-            table,
-            result.row_count,
-            row_count_total_2,
+    # The context manager guarantees the scratch file is closed even if a window fetch raises
+    # before finish() (e.g. a persistently short window) — the job then fails without leaking the
+    # handle, and the partial file is never moved to out/tables/ (component.py only moves on success).
+    with _RowConsumer(schema, csv_path) as consumer:
+        if row_count_total > 0:
+            offsets = list(range(0, row_count_total, _WINDOW_CHUNK))
+            batch_span = _WINDOW_WORKERS * 2
+            with ThreadPoolExecutor(max_workers=_WINDOW_WORKERS) as pool:
+                for i in range(0, len(offsets), batch_span):
+                    batch = offsets[i : i + batch_span]
+                    futures = [
+                        pool.submit(
+                            _fetch_window, client, table, key, start, min(_WINDOW_CHUNK, row_count_total - start)
+                        )
+                        for start in batch
+                    ]
+                    for future in futures:
+                        consumer.consume(future.result())
+        result = consumer.finish()
+
+    if result.row_count != row_count_total:
+        raise UserException(
+            f"Failed to fetch table '{table}': extracted {result.row_count} rows but the API reported "
+            f"{row_count_total}. A window was lost or the paged result changed mid-fetch — re-run the extraction."
         )
+    logger.debug("Table %s: fetched %d rows (pk_unique=%s).", table, result.row_count, result.pk_unique)
     return result

@@ -1,9 +1,9 @@
 """HTTP client for the Retain Cloud DataAccessAPI."""
 
 import base64
-import contextlib
 import json
 import logging
+import threading
 import time
 
 import requests
@@ -24,14 +24,9 @@ _TOKEN_REFRESH_MARGIN_SECONDS = 300
 # (connect, read) seconds, applied to every call this client makes (see `_request_raw` override
 # below). Neither `HttpClient` nor `requests` sets a default, so without this an unreachable or
 # hanging host blocks the job forever — and a connection that never completes never reaches the
-# retry adapter either. The read side is generous — raised from an original 60s — as DEFENSIVE
-# headroom for a legitimately large single-call table (e.g. a ~835k-row table fetched in one
-# `paging/paged` call): this is NOT the fix for the report-table 504s (see `fetch_table_page`'s
-# `fail_fast_on_http_error` / `describe_request_error`'s docstrings) — a bigger CLIENT-side timeout
-# cannot fix a deterministic SERVER-side `504 Gateway Timeout`, since the server has already given
-# up and answered before this timeout would ever fire. For a `stream=True` response
-# (`fetch_table_page`), `requests`' read timeout is the gap between individual chunks, not the
-# total download time, so this stays safe even for the largest tables (spec §9 risk #1).
+# retry adapter either. The read side is generous headroom for a slow `create_page_result` POST or
+# a slow window GET; it is NOT how large tables are handled — those are paged into many small
+# windows by `extractor.fetch_table`, so no single call ever has to return a whole big table.
 _DEFAULT_TIMEOUT: tuple[float, float] = (10.0, 300.0)
 
 # Reasons surfaced only for the small set of statuses worth calling out specifically — enough for a
@@ -118,39 +113,18 @@ class RetainCloudClient(HttpClient):
         self._username = username
         self._password = password
         self._token_exp = 0
+        # Guards token refresh so concurrent window fetches (extractor.fetch_table uses a thread
+        # pool) cannot re-authenticate at the same time and race on the shared auth header.
+        self._auth_lock = threading.Lock()
+        # Bumped on every successful authenticate(). Lets a 401 retry COALESCE: a worker only
+        # re-authenticates if the token has not already changed since its own request went out, so N
+        # concurrent 401s trigger ONE reauth, not N serial ones.
+        self._token_version = 0
 
     def _request_raw(self, method: str, endpoint_path: str | None = None, **kwargs) -> requests.Response:
         """Apply `_DEFAULT_TIMEOUT` to every request this client makes, unless a caller overrides it."""
         kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
         return super()._request_raw(method, endpoint_path, **kwargs)
-
-    @contextlib.contextmanager
-    def _no_forced_status_retries(self):
-        """Temporarily disable HTTP-status-based retries (`status_forcelist`) for calls made inside
-        this block. Connection/read-level retries (`self.max_retries`, still applied by the
-        underlying `Retry`'s `connect`/`read` budgets) are untouched — only a FORCED-status retry
-        (429/500/502/503/504) is skipped.
-
-        Used by `fetch_table_page` for the SECOND `paging/paged` call only (the one sized to a
-        table's full remaining row count, per `extractor.fetch_table`'s algorithm): a report table
-        with millions of rows (e.g. `resourcenumdenreport`) cannot be generated and returned by the
-        API in a single request, so that call can get a DETERMINISTIC `504 Gateway Timeout` — and
-        retrying a deterministic failure 5 times (`HttpClient`'s configured `max_retries`) just
-        burns ~5x the wall-clock time to reach the exact same outcome. Disabling the forced-status
-        retry for this one call lets the real `504` response reach `fetch_table_page` so it can
-        raise a specific, actionable error (naming the status and the row count) immediately,
-        instead of a generic "unavailable after retries" one after several minutes.
-
-        `HttpClient._requests_retry_session` rebuilds its `Retry` object from `self.status_forcelist`
-        on every call (it is not cached at construction time), which is what makes a plain
-        set-then-restore around one call safe here — no other in-flight call is affected.
-        """
-        original = self.status_forcelist
-        self.status_forcelist = ()
-        try:
-            yield
-        finally:
-            self.status_forcelist = original
 
     def authenticate(self) -> None:
         """POST the credentials to `IntegrationApi/token` and store the resulting bearer token.
@@ -201,10 +175,28 @@ class RetainCloudClient(HttpClient):
                 "Retain Cloud authentication succeeded but returned an unrecognized token format."
             ) from e
         self.update_auth_header({"Authorization": token_body}, overwrite=True)
+        self._token_version += 1
 
     def _ensure_token(self) -> None:
+        # Double-checked locking: the common case (token still valid) stays lock-free, but once a
+        # refresh is due, only ONE of several concurrent worker threads actually re-authenticates —
+        # the rest find a fresh token on the second check and skip it.
         if self._token_exp - time.time() < _TOKEN_REFRESH_MARGIN_SECONDS:
-            self.authenticate()
+            with self._auth_lock:
+                if self._token_exp - time.time() < _TOKEN_REFRESH_MARGIN_SECONDS:
+                    self.authenticate()
+
+    def _reauth_if_stale(self, seen_version: int) -> None:
+        """Re-authenticate for a 401, but only if no other thread already has.
+
+        `seen_version` is the token version in effect when the caller's request went out. Under the
+        lock, we re-authenticate only when the version has not moved since — so several workers that
+        all get a 401 from the same rotated token trigger a single reauth, and the rest just retry
+        with the token the winner fetched.
+        """
+        with self._auth_lock:
+            if self._token_version == seen_version:
+                self.authenticate()
 
     def _get_with_reauth(self, path: str, **kwargs):
         # Deliberately `get_raw` (undecorated), not `get` — `HttpClient.get`'s
@@ -213,13 +205,14 @@ class RetainCloudClient(HttpClient):
         # reauth-and-retry below. `get_raw` does no such logging, matching the manual
         # `raise_for_status()` pattern `fetch_table_page` already uses with `post_raw`.
         logger.debug("Retain Cloud: GET %s", path)
+        seen_version = self._token_version
         response = self.get_raw(path, **kwargs)
         try:
             response.raise_for_status()
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 401:
                 logger.info("Retain Cloud token expired mid-request for %s; re-authenticating and retrying.", path)
-                self.authenticate()
+                self._reauth_if_stale(seen_version)
                 response = self.get_raw(path, **kwargs)
                 response.raise_for_status()
             else:
@@ -239,59 +232,85 @@ class RetainCloudClient(HttpClient):
         self._ensure_token()
         return self._get_with_reauth("structure/richfieldstructure", params={"table": table})
 
-    def fetch_table_page(
-        self, table: str, page_size: int, *, fail_fast_on_http_error: bool = False
-    ) -> requests.Response:
-        """Issue one `paging/paged` call and return the raw, streamable response.
+    def _post_json_with_reauth(self, path: str, *, params: dict | None = None, json_body: dict | None = None):
+        """POST a JSON body, return the parsed JSON response, re-authenticating once on a 401.
 
-        The caller (`extractor.py`) is responsible for consuming `response.raw` with `ijson` — this
-        method never reads the body itself, so the "one/two calls per table" contract (spec §6)
-        stays entirely in the caller's hands.
+        The POST analogue of `_get_with_reauth`. Uses `post_raw` (undecorated) for the same reason —
+        to skip `HttpClient.post`'s unconditional WARNING-with-traceback on the 401 this handles
+        gracefully. The 401 reauth coalesces via `_reauth_if_stale` so concurrent callers that all
+        get a 401 from the same rotated token trigger a single reauth, not one each.
+        """
+        logger.debug("Retain Cloud: POST %s", path)
+        body = json_body if json_body is not None else {}
+        seen_version = self._token_version
+        response = self.post_raw(path, params=params, json=body)
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 401:
+                logger.info("Retain Cloud token expired mid-request for %s; re-authenticating and retrying.", path)
+                self._reauth_if_stale(seen_version)
+                response = self.post_raw(path, params=params, json=body)
+                response.raise_for_status()
+            else:
+                raise
+        logger.debug("Retain Cloud: %s returned HTTP %s.", path, response.status_code)
+        return response.json()
 
-        `json={}` is REQUIRED, not cosmetic: a bodyless POST to this endpoint returns a generic
-        `400 {"status":"error","message":"invalid request"}` before the endpoint ever looks at
-        `pageSize`/`sequential` — confirmed live against the real API (Phase 5 VCR recording hit
-        this exact 400; a follow-up probe isolated it to the missing body/`Content-Type`, since an
-        empty JSON object made the identical call return 200). `pageSize`/`sequential` still belong
-        in the query string per the resolved paging contract (research §3: the endpoint has no
-        body-driven DTO for them at all — an empty body's presence is what satisfies the framework's
-        request-model binding, its *content* is irrelevant and any extra keys are silently ignored).
+    def create_page_result(self, table: str, fields: list[str]) -> tuple[str, int]:
+        """Create a server-side paged result set; return its `(key, total_row_count)`.
 
-        `fail_fast_on_http_error`: when True, wraps this call in `_no_forced_status_retries` — see
-        its docstring. `extractor.fetch_table` sets this for the SECOND call only (sized to a
-        table's full remaining row count), where a large report table can trigger a deterministic
-        `504` that retrying would not fix.
+        Step 1 of Retain's real paging contract. `POST tableaccess/{table}/paging/paged` with
+        `pageSize=1` (we don't want a large first page here, only the handle and the total) and an
+        explicit `fields` list in the body. The `key` in the response is a handle to a cached,
+        materialized result set; `fetch_page_window` then reads arbitrary windows of it by GET.
 
-        Also note: the live API does not always honor `pageSize` (observed returning every row of a
-        64k-row table for a `pageSize` of 100) — callers must not assume the response is capped at
-        `page_size`, only that a `rowCount` short of what's needed triggers a second call.
+        The explicit `fields` body is REQUIRED, not cosmetic. For a large table the SAME call with
+        an empty body (`{}`) returns a deterministic `504 Gateway Timeout` at ~20s, while naming the
+        columns returns in a few seconds. Verified live: `resourceidsdedreport` /
+        `resourcenumdenreport` (which have ZERO calculated fields) 504 without the body and succeed
+        with it — so it is the explicit field list itself, not the exclusion of any field category,
+        that avoids the timeout.
+
+        `fields` must contain only NON-calculated columns: listing a Retain `CalculatedField` makes
+        this call return `400` (verified live on `booking`). The caller (`extractor.fetch_table`)
+        already filters them out. The released single-call projection never returned calculated
+        fields either, so excluding them keeps the output columns in parity.
         """
         self._ensure_token()
-        params = {"pageSize": page_size, "sequential": "true"}
         path = f"tableaccess/{table}/paging/paged"
-        logger.debug(
-            "Retain Cloud: requesting paging/paged for table %r (pageSize=%d, fail_fast=%s).",
-            table,
-            page_size,
-            fail_fast_on_http_error,
-        )
-        retry_scope = self._no_forced_status_retries() if fail_fast_on_http_error else contextlib.nullcontext()
-        with retry_scope:
-            response = self.post_raw(path, params=params, json={}, stream=True)
-            try:
-                response.raise_for_status()
-            except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code == 401:
-                    logger.info(
-                        "Retain Cloud token expired mid-request for table %r; re-authenticating and retrying.", table
-                    )
-                    self.authenticate()
-                    response = self.post_raw(path, params=params, json={}, stream=True)
-                    response.raise_for_status()
-                else:
-                    raise
-        logger.debug("Retain Cloud: paging/paged for table %r returned HTTP %s.", table, response.status_code)
-        # requests does not auto-decompress `response.raw` the way it does `.content`/`.json()` —
-        # without this, a gzip-compressed body would be handed to ijson as garbled raw bytes.
-        response.raw.decode_content = True
-        return response
+        params = {"pageSize": 1, "sequential": "false"}
+        body = {"fields": [{"fieldName": name} for name in fields]}
+        logger.debug("Retain Cloud: creating paged result for table %r (%d fields).", table, len(fields))
+        payload = self._post_json_with_reauth(path, params=params, json_body=body)
+        try:
+            return payload["key"], int(payload["rowCount"])
+        except (KeyError, TypeError, ValueError) as e:
+            # A 200 whose body lacks `key`/`rowCount` (e.g. a vendor contract change) must fail as a
+            # clean UserException for this row, not leak a raw KeyError up to `__main__`'s exit-2.
+            raise UserException(
+                f"Retain Cloud returned an unexpected response when creating a paged result for table '{table}'."
+            ) from e
+
+    def fetch_page_window(self, table: str, key: str, start: int, count: int) -> list[dict]:
+        """Read one window `[start, start+count)` of a created page result (step 2 of the contract).
+
+        `GET tableaccess/{table}/paging/paged?id={key}&from={start}&count={count}` returns a bare
+        JSON array of row objects (NOT the create-call envelope). Different `from` values return
+        different, stable windows — this is the batch-advance mechanism the old single-call model
+        lacked. Safe to call concurrently: `HttpClient` builds a fresh `requests.Session` per call,
+        and token refresh is guarded by `_auth_lock`.
+        """
+        self._ensure_token()
+        path = f"tableaccess/{table}/paging/paged"
+        params = {"id": key, "from": start, "count": count}
+        rows = self._get_with_reauth(path, params=params)
+        if not isinstance(rows, list):
+            raise UserException(f"Retain Cloud returned a non-array window for table '{table}' (from={start}).")
+        if not all(isinstance(row, dict) for row in rows):
+            # A valid JSON array can still carry non-objects (e.g. `[null]`); without this guard the
+            # consumer's `row.get(...)` would raise AttributeError and exit 2 instead of a clean error.
+            raise UserException(
+                f"Retain Cloud returned a non-object row in a window for table '{table}' (from={start})."
+            )
+        return rows

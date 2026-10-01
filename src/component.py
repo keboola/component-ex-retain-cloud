@@ -14,7 +14,6 @@ from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
 
-import ijson
 import requests
 from keboola.component.base import ComponentBase, sync_action
 from keboola.component.dao import SupportedDataTypes
@@ -224,14 +223,11 @@ class Component(ComponentBase):
         try:
             self._process_table(client, cfg)
         except requests.exceptions.RequestException as e:
+            # This also covers a malformed/truncated response body: `response.json()` raises
+            # `requests.exceptions.JSONDecodeError`, which IS a `RequestException` subclass, so a bad
+            # paging response fails this row's job as a clean `UserException` (exit 1) rather than
+            # falling through to `__main__`'s bare `except Exception` (exit 2, "unexpected bug").
             raise UserException(self._describe_request_failure(f"Failed to fetch table '{cfg.table}'", e)) from e
-        except ijson.JSONError as e:
-            # `ijson.JSONError` is NOT a `requests.exceptions.RequestException` subclass (it's a
-            # plain `Exception`), so it needs its own clause: a malformed/truncated `paging/paged`
-            # body must still fail this row's job as a `UserException` (exit 1), not fall through
-            # to `__main__`'s bare `except Exception` (exit 2, "unexpected internal bug") — a
-            # malformed response from the source API is a user-visible, not a code, problem.
-            raise UserException(f"Failed to fetch table '{cfg.table}': received a malformed response.") from e
 
     @staticmethod
     def _describe_request_failure(prefix: str, error: requests.exceptions.RequestException) -> str:
@@ -262,12 +258,10 @@ class Component(ComponentBase):
         return client
 
     def _process_table(self, client: RetainCloudClient, cfg: Configuration) -> None:
-        logger.debug(
-            "Table %s: starting extraction (load_type=%s, page_size=%d).", cfg.table, cfg.load_type, cfg.page_size
-        )
+        logger.debug("Table %s: starting extraction (load_type=%s).", cfg.table, cfg.load_type)
         rich_fields = client.get_table_schema(cfg.table)
         schema = build_table_schema(cfg.table, rich_fields)
-        result = fetch_table(client, cfg.table, schema, cfg.page_size, _SCRATCH_DIR)
+        result = fetch_table(client, cfg.table, schema, _SCRATCH_DIR)
 
         incremental_for_table = cfg.incremental and result.pk_unique
         if cfg.incremental and not result.pk_unique:

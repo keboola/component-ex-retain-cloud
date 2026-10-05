@@ -151,6 +151,27 @@ class TestRunOrchestration(unittest.TestCase):
     @mock.patch("component.fetch_table")
     @mock.patch("component.build_table_schema")
     @mock.patch("component.RetainCloudClient")
+    def test_run_logs_table_start_and_summary_at_info(self, mock_client_cls, mock_build_schema, mock_fetch_table):
+        # Before this, every progress message was DEBUG, so a job log showed nothing between
+        # "component started" and the output-mapping phase — even for a 15-minute extraction.
+        client = mock_client_cls.return_value
+        client.list_tables.return_value = ["booking"]
+        mock_build_schema.return_value = _schema("booking")
+        mock_fetch_table.side_effect = lambda _client, table, _schema, scratch_dir: _fetch_result(
+            scratch_dir, table, row_count=3
+        )
+
+        comp = self._component()
+        with self.assertLogs("component", level="INFO") as logs:
+            comp.run()
+
+        messages = [r.getMessage() for r in logs.records if r.levelno == 20]
+        self.assertTrue(any("booking" in m and "start" in m.lower() for m in messages), messages)
+        self.assertTrue(any("booking" in m and "3 row" in m for m in messages), messages)
+
+    @mock.patch("component.fetch_table")
+    @mock.patch("component.build_table_schema")
+    @mock.patch("component.RetainCloudClient")
     def test_table_fetch_failure_raises_user_exception(self, mock_client_cls, mock_build_schema, mock_fetch_table):
         client = mock_client_cls.return_value
         client.list_tables.return_value = ["booking"]

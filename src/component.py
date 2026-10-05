@@ -258,7 +258,7 @@ class Component(ComponentBase):
         return client
 
     def _process_table(self, client: RetainCloudClient, cfg: Configuration) -> None:
-        logger.debug("Table %s: starting extraction (load_type=%s).", cfg.table, cfg.load_type)
+        logger.info("Table %s: starting extraction (load type: %s).", cfg.table, cfg.load_type.value)
         rich_fields = client.get_table_schema(cfg.table)
         schema = build_table_schema(cfg.table, rich_fields)
         result = fetch_table(client, cfg.table, schema, _SCRATCH_DIR)
@@ -277,13 +277,18 @@ class Component(ComponentBase):
         # print(inspect.signature(ComponentBase.create_out_table_definition_from_schema))"` reports
         # `(self, table_schema, is_sliced=False, destination='', incremental: bool = None,
         # enclosure='"', delimiter=',', delete_where=None)` — `incremental` is real.
-        table_def = self.create_out_table_definition_from_schema(
-            self._to_output_schema(schema, result.pk_unique, result.verified_columns),
-            incremental=incremental_for_table,
-        )
+        output_schema = self._to_output_schema(schema, result.pk_unique, result.verified_columns)
+        table_def = self.create_out_table_definition_from_schema(output_schema, incremental=incremental_for_table)
         Path(table_def.full_path).parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(result.scratch_path), table_def.full_path)
         self.write_manifest(table_def)
+        logger.info(
+            "Table %s: wrote %d row(s) to the output table (%s load, primary key: %s).",
+            cfg.table,
+            result.row_count,
+            "incremental" if incremental_for_table else "full",
+            ", ".join(output_schema.primary_keys) if output_schema.primary_keys else "none",
+        )
 
     @staticmethod
     def _to_output_schema(schema: TableSchema_, pk_unique: bool, verified_columns: dict[str, bool]) -> TableSchema:

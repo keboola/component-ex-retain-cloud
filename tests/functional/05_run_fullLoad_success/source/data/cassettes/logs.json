@@ -1,5 +1,36 @@
 {
   "exit_code": null,
   "stderr": "",
-  "logs": []
+  "logs": [
+    {
+      "level": "INFO",
+      "logger": "client",
+      "message": "Retain Cloud: authenticated (environment=us, HTTP 200).",
+      "timestamp": "2026-10-01T10:53:42.000Z"
+    },
+    {
+      "level": "INFO",
+      "logger": "component",
+      "message": "Table billingtype: starting extraction (load type: full_load).",
+      "timestamp": "2026-10-01T10:53:42.000Z"
+    },
+    {
+      "level": "INFO",
+      "logger": "extractor",
+      "message": "Table billingtype: fetching 2 rows in 1 windows of up to 3000 rows with 6 workers (3 of 3 columns requested).",
+      "timestamp": "2026-10-01T10:53:42.000Z"
+    },
+    {
+      "level": "INFO",
+      "logger": "extractor",
+      "message": "Table billingtype: fetched 2 rows in 0s (primary key verified unique: True).",
+      "timestamp": "2026-10-01T10:53:42.000Z"
+    },
+    {
+      "level": "INFO",
+      "logger": "component",
+      "message": "Table billingtype: wrote 2 row(s) to the output table (full load, primary key: billingtype_guid).",
+      "timestamp": "2026-10-01T10:53:42.000Z"
+    }
+  ]
 }

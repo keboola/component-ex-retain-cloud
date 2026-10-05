@@ -160,7 +160,10 @@ class RetainCloudClient(HttpClient):
             # — see its docstring.
             raise UserException(describe_request_error("Retain Cloud authentication failed", e)) from e
 
-        logger.debug("Retain Cloud: auth token request succeeded (HTTP %s).", response.status_code)
+        # INFO, not DEBUG: this is the first thing a job does after "component started", and without
+        # it the job log is silent until the output-mapping phase. Never includes the token body,
+        # the username or the password.
+        logger.info("Retain Cloud: authenticated (environment=%s, HTTP %s).", self._environment, response.status_code)
         token_body = response.text.strip()
         try:
             self._token_exp = decode_jwt_exp(token_body)

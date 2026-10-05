@@ -63,15 +63,26 @@ FULL_LOAD_TEST = "05_run_fullLoad_success"
 # `tests/setup/*.json` is ever renamed.
 _TENANT_PATH_NORMALIZER = (r"(/DataAccessAPI/)[^/\s]+(/)", r"\g<1><TENANT>\g<2>")
 
+# `extractor.fetch_table`'s finish line reports wall-clock time ("fetched 2 rows in 0s" /
+# "in 12m 07s"). Replay is near-instant, but a loaded CI runner can still tick it over to "1s",
+# which would fail the comparison on nothing but timing. Canonicalise the duration on both sides.
+_DURATION_NORMALIZER = (r"\bin (?:\d+m )?\d+s\b", "in <DURATION>")
+
 
 class _LogNormalizingTestDataDir(VCRTestDataDir):
-    """`VCRTestDataDir` with DEFAULT_NORMALIZERS put back, plus the tenant-path normalizer."""
+    """`VCRTestDataDir` with DEFAULT_NORMALIZERS put back, plus the tenant-path and duration
+    normalizers."""
 
     def _setup_vcr(self):
         super()._setup_vcr()
         if self.vcr_recorder is not None:
             own = self.vcr_recorder.log_normalizers or []
-            self.vcr_recorder.log_normalizers = [*DEFAULT_NORMALIZERS, *own, _TENANT_PATH_NORMALIZER]
+            self.vcr_recorder.log_normalizers = [
+                *DEFAULT_NORMALIZERS,
+                *own,
+                _TENANT_PATH_NORMALIZER,
+                _DURATION_NORMALIZER,
+            ]
 
 
 @pytest.mark.parametrize("test_name", get_test_cases(FUNCTIONAL_DIR))
@@ -105,6 +116,16 @@ def test_tenant_path_normalizer_reconciles_both_redaction_spellings():
     )
     # Nothing outside the tenant slot is touched.
     assert "tableaccess/billingtype/paging/paged" in recorded
+
+
+def test_duration_normalizer_canonicalises_fetch_timing():
+    """A replay that takes 1s instead of the recorded 0s must not fail the log comparison."""
+    normalizers = [*DEFAULT_NORMALIZERS, _TENANT_PATH_NORMALIZER, _DURATION_NORMALIZER]
+    line = "Table billingtype: fetched 2 rows in {} (primary key verified unique: True)."
+    assert normalize_message(line.format("0s"), normalizers) == normalize_message(line.format("1s"), normalizers)
+    assert normalize_message(line.format("12m 07s"), normalizers) == line.format("<DURATION>")
+    # Row counts are not durations and must survive untouched.
+    assert "fetched 2 rows" in normalize_message(line.format("0s"), normalizers)
 
 
 # ---------------------------------------------------------------------------------------------

@@ -99,6 +99,21 @@ class TestRetainCloudClientAuth(unittest.TestCase):
         self.assertEqual(self.client._auth_header["Authorization"], _fake_jwt(exp))
 
     @mock.patch.object(RetainCloudClient, "post_raw")
+    def test_authenticate_logs_success_at_info_without_credentials(self, mock_post_raw):
+        token = _fake_jwt(int(time.time()) + 3600)
+        mock_post_raw.return_value = _response(status_code=200, text=token)
+
+        with self.assertLogs("client", level="INFO") as logs:
+            self.client.authenticate()
+
+        messages = [r.getMessage() for r in logs.records if r.levelno == 20]
+        self.assertTrue(any("authenticated" in m.lower() for m in messages), messages)
+        for m in messages:
+            self.assertNotIn("pw", m)
+            self.assertNotIn("user@example.com", m)
+            self.assertNotIn(token, m)
+
+    @mock.patch.object(RetainCloudClient, "post_raw")
     def test_authenticate_sends_credentials_not_environment_host(self, mock_post_raw):
         mock_post_raw.return_value = _response(status_code=200, text=_fake_jwt(int(time.time()) + 3600))
         self.client.authenticate()

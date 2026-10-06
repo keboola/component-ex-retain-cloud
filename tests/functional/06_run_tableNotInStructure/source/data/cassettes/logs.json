@@ -3,6 +3,12 @@
   "stderr": "Component failed with a user error: Table 'zzz_table_does_not_exist_xyz' is no longer present in this tenant's structure.\n",
   "logs": [
     {
+      "level": "INFO",
+      "logger": "client",
+      "message": "Retain Cloud: authenticated (environment=us, HTTP 200).",
+      "timestamp": "2026-09-21T17:41:51.000Z"
+    },
+    {
       "level": "ERROR",
       "logger": "__main__",
       "message": "Component failed with a user error: Table 'zzz_table_does_not_exist_xyz' is no longer present in this tenant's structure.",

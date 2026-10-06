@@ -1,5 +1,6 @@
 import csv
 import io
+import tracemalloc
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -9,7 +10,7 @@ from keboola.component.exceptions import UserException
 
 import extractor
 from client import RetainCloudClient
-from extractor import build_table_schema, fetch_table, safe_column_name
+from extractor import PkTracker, build_table_schema, fetch_table, safe_column_name
 
 RICH_FIELDS_BOOKING = [
     {"name": "booking_guid", "dataType": "ID"},
@@ -66,6 +67,21 @@ class _FakeClient(RetainCloudClient):
         assert key == self._key, "window read used a key the create call did not return"
         self.window_calls.append((start, count))
         return self._rows[start : start + count]
+
+
+class _LazyRowsClient(_FakeClient):
+    """Builds each window's rows on demand, so every row object is allocated INSIDE the fetch —
+    exactly as `response.json()` does in production. A pre-materialized row list (as `_FakeClient`
+    holds) would let the extractor keep references to strings the test had already paid for, hiding
+    any per-row memory the extractor itself retains."""
+
+    def __init__(self, total: int):
+        super().__init__(rows=[], reported_row_count=total)
+        self._total = total
+
+    def fetch_page_window(self, table: str, key: str, start: int, count: int) -> list[dict]:
+        self.window_calls.append((start, count))
+        return [_booking_row(f"guid-{i}") for i in range(start, min(start + count, self._total))]
 
 
 class TestBuildTableSchema(unittest.TestCase):
@@ -171,6 +187,53 @@ class TestSafeColumnName(unittest.TestCase):
         self.assertGreater(len(name_b), 64)
         self.assertEqual(name_a[:55], name_b[:55])
         self.assertNotEqual(safe_column_name(name_a), safe_column_name(name_b))
+
+
+class TestPkTracker(unittest.TestCase):
+    """Primary-key uniqueness is tracked on disk, not in a Python set: a 3.48M-row table's GUIDs
+    alone would need ~430 MB in-process, past the 256 MB container limit the job runs under."""
+
+    def setUp(self):
+        self.scratch_dir = Path("/tmp/ex-retain-cloud-test")
+        self.scratch_dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.scratch_dir / "pk-test.sqlite"
+        self.path.unlink(missing_ok=True)
+
+    def test_distinct_values_verify_unique(self):
+        with PkTracker(self.path) as tracker:
+            for v in ("a", "b", "c"):
+                tracker.add(v)
+            self.assertTrue(tracker.is_unique(row_count=3))
+
+    def test_duplicate_value_is_not_unique(self):
+        with PkTracker(self.path) as tracker:
+            for v in ("a", "a", "b"):
+                tracker.add(v)
+            self.assertFalse(tracker.is_unique(row_count=3))
+
+    def test_null_value_is_not_unique(self):
+        # A null/missing PK must never count as "the one unique value" — same rule as before.
+        with PkTracker(self.path) as tracker:
+            tracker.add("a")
+            tracker.add(None)
+            self.assertFalse(tracker.is_unique(row_count=2))
+
+    def test_zero_rows_verify_unique(self):
+        with PkTracker(self.path) as tracker:
+            self.assertTrue(tracker.is_unique(row_count=0))
+
+    def test_values_compared_as_their_csv_text(self):
+        # The CSV cell is what Storage dedupes on, so 1 and "1" are the same key.
+        with PkTracker(self.path) as tracker:
+            tracker.add(1)
+            tracker.add("1")
+            self.assertFalse(tracker.is_unique(row_count=2))
+
+    def test_close_removes_the_on_disk_store(self):
+        tracker = PkTracker(self.path)
+        tracker.add("a")
+        tracker.close()
+        self.assertFalse(self.path.exists())
 
 
 class TestFetchTableWindowed(unittest.TestCase):
@@ -315,6 +378,79 @@ class TestFetchTableWindowed(unittest.TestCase):
         with self.assertRaises(UserException) as ctx:
             fetch_table(client, "calc_only", schema, scratch_dir=self.scratch_dir)
         self.assertIn("no non-calculated columns", str(ctx.exception))
+
+    def test_many_windows_beyond_pipeline_depth_stay_in_order(self):
+        # 30 single-row windows is well past however many windows the fetch keeps in flight at once,
+        # so this exercises the refill path (submit the next window as one is consumed) and proves
+        # output order still follows offset order, not completion order.
+        rows = [_booking_row(f"g{i:02d}") for i in range(30)]
+        client = _FakeClient(rows)
+
+        with mock.patch.object(extractor, "_WINDOW_CHUNK", 1):
+            result = fetch_table(client, "booking", self.schema, scratch_dir=self.scratch_dir)
+
+        self.assertEqual(result.row_count, 30)
+        self.assertEqual(sorted(client.window_calls), [(i, 1) for i in range(30)])
+        written_rows = list(csv.reader(io.StringIO(result.scratch_path.read_text())))
+        self.assertEqual([r[0] for r in written_rows], [f"g{i:02d}" for i in range(30)])
+
+    def test_python_heap_does_not_grow_with_row_count(self):
+        # Regression for the production OOM (job killed at the 256 MB container limit on a 3.48M-row
+        # table): the extractor must not retain anything per row — neither a primary-key value set
+        # nor whole fetched windows past their consumption. 150k rows at 100 rows/window: a per-row
+        # PK set alone would retain ~17 MB here; a bounded pipeline of tiny windows retains ~1 MB.
+        total = 150_000
+        client = _LazyRowsClient(total)
+
+        tracemalloc.start()
+        try:
+            baseline, _ = tracemalloc.get_traced_memory()
+            with mock.patch.object(extractor, "_WINDOW_CHUNK", 100):
+                result = fetch_table(client, "booking", self.schema, scratch_dir=self.scratch_dir)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        self.assertEqual(result.row_count, total)
+        self.assertTrue(result.pk_unique)
+        growth_mb = (peak - baseline) / (1024 * 1024)
+        self.assertLess(growth_mb, 8, f"extractor retained {growth_mb:.1f} MB of Python heap for {total} rows")
+
+    def test_logs_start_and_finish_at_info(self):
+        rows = [_booking_row(g) for g in ("a", "b", "c", "d", "e")]
+        client = _FakeClient(rows)
+
+        with (
+            mock.patch.object(extractor, "_WINDOW_CHUNK", 2),
+            self.assertLogs("extractor", level="INFO") as logs,
+        ):
+            fetch_table(client, "booking", self.schema, scratch_dir=self.scratch_dir)
+
+        messages = [r.getMessage() for r in logs.records if r.levelno == 20]  # INFO only
+        self.assertTrue(
+            any("booking" in m and "5 rows" in m and "window" in m for m in messages),
+            f"no INFO start line naming the table, row total and windowing; got {messages}",
+        )
+        self.assertTrue(
+            any("booking" in m and "fetched 5 rows" in m for m in messages),
+            f"no INFO finish line with the fetched row count; got {messages}",
+        )
+
+    def test_logs_progress_milestones_at_info(self):
+        # A multi-million-row table runs for many minutes; the job log must show it advancing.
+        # 20 single-row windows → progress is reported at roughly every 10% of the total.
+        rows = [_booking_row(f"g{i:02d}") for i in range(20)]
+        client = _FakeClient(rows)
+
+        with (
+            mock.patch.object(extractor, "_WINDOW_CHUNK", 1),
+            self.assertLogs("extractor", level="INFO") as logs,
+        ):
+            fetch_table(client, "booking", self.schema, scratch_dir=self.scratch_dir)
+
+        progress = [r.getMessage() for r in logs.records if r.levelno == 20 and "rows fetched (" in r.getMessage()]
+        self.assertGreaterEqual(len(progress), 5, f"expected periodic progress lines, got {progress}")
+        self.assertTrue(all("/ 20 rows fetched" in m for m in progress), progress)
 
 
 if __name__ == "__main__":

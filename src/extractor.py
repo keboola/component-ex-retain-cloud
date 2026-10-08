@@ -160,8 +160,7 @@ def build_table_schema(table: str, rich_fields: list[dict]) -> TableSchema_:
     # keys are ALSO guids — e.g. `booking` carries `booking_guid` (its PK) plus `booking_resource_guid`
     # / `booking_job_guid` (FKs); matching any `_guid` column would pick an FK. The API is inconsistent
     # about casing (`SkillType_guid`, `SkillLevel_Guid`), so compare case-insensitively and keep the
-    # column's ACTUAL name as the PK — row dicts are keyed by the real casing, so a lowercased guess
-    # would break `row.get(pk_column)` at fetch time.
+    # schema's spelling as the PK — `_RowConsumer` resolves row keys onto the schema's spelling.
     pk_candidate_lower = f"{table}_guid".lower()
     columns: list[ColumnSchema] = []
     pk_column: str | None = None
@@ -348,6 +347,13 @@ class _RowConsumer:
         self._schema = schema
         self._csv_path = csv_path
         self._fieldnames = [c.name for c in schema.columns]
+        self._fieldname_set = set(self._fieldnames)
+        # Row keys do not always use the schema's spelling: the API's JSON serializer lowers the
+        # first letter of every key, so the schema's `SkillLevel_Guid` arrives as `skillLevel_Guid`.
+        # Each row key is resolved to its schema column case-insensitively, an exact spelling wins,
+        # and the resolution is cached per distinct key.
+        self._column_by_lower = {c.name.lower(): c.name for c in schema.columns}
+        self._column_by_key = {name: name for name in self._fieldnames}
         self._declared_by_name = {c.name: c.declared_type for c in schema.columns}
         self.verified = {c.name: True for c in schema.columns if c.declared_type in _VERIFY_TYPES}
         self.row_count = 0
@@ -372,10 +378,20 @@ class _RowConsumer:
                 self._pk.close()
             self._closed = True
 
+    def _to_schema_keys(self, row: dict) -> dict:
+        out = {}
+        for key, value in row.items():
+            column = self._column_by_key.get(key)
+            if column is None:
+                column = self._column_by_key[key] = self._column_by_lower.get(key.lower(), key)
+            out[column] = value
+        return out
+
     def consume(self, rows: list[dict]) -> None:
-        for row in rows:
+        for raw_row in rows:
+            row = self._to_schema_keys(raw_row)
             self.row_count += 1
-            extra_keys = set(row) - set(self._fieldnames)
+            extra_keys = set(row) - self._fieldname_set
             if extra_keys and not self._schema_drift_logged:
                 logger.warning(
                     "Table %s: row carries fields outside the discovered schema: %s",

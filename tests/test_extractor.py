@@ -296,6 +296,43 @@ class TestFetchTableWindowed(unittest.TestCase):
         written_rows = list(csv.reader(io.StringIO(result.scratch_path.read_text())))
         self.assertEqual(written_rows[0], ["g1", "Alpha", ""])
 
+    def test_row_keys_matched_to_schema_case_insensitively(self):
+        # The schema says `SkillLevel_Guid`, but the JSON serializer lowers the first letter of every
+        # row key (`skillLevel_Guid`). A field spelled identically on both sides (`skilllevel_notes`)
+        # must keep working alongside the case-shifted ones.
+        schema = build_table_schema(
+            "SkillLevel",
+            [
+                {"name": "SkillLevel_Guid", "dataType": "ID"},
+                {"name": "SkillLevel_Description", "dataType": "String"},
+                {"name": "SkillLevel_Order", "dataType": "Int"},
+                {"name": "skilllevel_notes", "dataType": "String"},
+            ],
+        )
+        rows = [
+            {
+                "skillLevel_Guid": "g1",
+                "skillLevel_Description": "Expert",
+                "skillLevel_Order": 1,
+                "skilllevel_notes": "n",
+            },
+            {
+                "skillLevel_Guid": "g2",
+                "skillLevel_Description": "<1 year",
+                "skillLevel_Order": 2,
+                "skilllevel_notes": None,
+            },
+        ]
+        client = _FakeClient(rows)
+
+        with self.assertNoLogs(extractor.logger, level="WARNING"):
+            result = fetch_table(client, "SkillLevel", schema, scratch_dir=self.scratch_dir)
+
+        written_rows = list(csv.reader(io.StringIO(result.scratch_path.read_text())))
+        self.assertEqual(written_rows, [["g1", "Expert", "1", "n"], ["g2", "<1 year", "2", ""]])
+        self.assertTrue(result.pk_unique)
+        self.assertTrue(result.verified_columns["SkillLevel_Order"])
+
     def test_pk_not_unique_on_duplicate(self):
         rows = [_booking_row("dup"), _booking_row("dup")]
         client = _FakeClient(rows)
